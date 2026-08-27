@@ -729,3 +729,361 @@ impl IdentityAwareSelector {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a policy whose "current" identity is schema 7, spec 3, sort 5,
+    /// recipe `v2`, with a 1000-byte target.
+    fn policy() -> WyrdSelectionPolicy {
+        WyrdSelectionPolicy {
+            schema_id: 7,
+            partition_spec_id: 3,
+            sort_order_id: 5,
+            writer_recipe: "v2".to_owned(),
+            recipe_resolver: WriterRecipeResolver::forge(),
+            target_file_size_bytes: 1000,
+            small_file_threshold_bytes: 400,
+            open_partitions: OpenPartitionPolicy::AllClosed,
+            emit_open_partition_tail: false,
+            event_time_field_id: None,
+        }
+    }
+
+    /// Builds a candidate that is current under [`policy`] in every respect.
+    fn current(path_recipe: &str, name: &str, size: u64) -> CandidateIdentity {
+        CandidateIdentity {
+            file_path: format!("s3://bucket/data/forge/{path_recipe}/part-0/{name}.parquet"),
+            schema_id: 7,
+            partition_spec_id: 3,
+            sort_order_id: Some(5),
+            partition_key: "part-0".to_owned(),
+            file_size_in_bytes: size,
+            min_event_time: None,
+            max_event_time: None,
+        }
+    }
+
+    #[test]
+    fn wyrd_selection_policy_covers_all_reasons_and_precedence() {
+        let selector = IdentityAwareSelector::new(policy()).unwrap();
+
+        // A file that is current and adequately sized is never selected.
+        assert_eq!(selector.classify(&current("v2", "healthy", 900)), None);
+        // The threshold is an exclusive lower bound: exactly at it is fine.
+        assert_eq!(selector.classify(&current("v2", "at_floor", 400)), None);
+        // The oversized bound is floor(1000 * 180 / 100) = 1800, inclusive.
+        assert_eq!(selector.policy().max_file_size_bytes().unwrap(), 1800);
+        assert_eq!(selector.classify(&current("v2", "at_ceiling", 1800)), None);
+
+        // Each reason in isolation.
+        let mut undersized = current("v2", "small", 399);
+        assert_eq!(
+            selector.classify(&undersized),
+            Some(SelectionReason::Undersized)
+        );
+        undersized.file_size_in_bytes = 1801;
+        assert_eq!(
+            selector.classify(&undersized),
+            Some(SelectionReason::Oversized)
+        );
+
+        let recipe_drift = current("v1", "old_recipe", 900);
+        assert_eq!(
+            selector.classify(&recipe_drift),
+            Some(SelectionReason::ObsoleteWriterRecipe)
+        );
+
+        let mut sort_drift = current("v2", "old_sort", 900);
+        sort_drift.sort_order_id = Some(4);
+        assert_eq!(
+            selector.classify(&sort_drift),
+            Some(SelectionReason::ObsoleteSortOrder)
+        );
+        // An absent sort order is drift too: the current table declares one.
+        sort_drift.sort_order_id = None;
+        assert_eq!(
+            selector.classify(&sort_drift),
+            Some(SelectionReason::ObsoleteSortOrder)
+        );
+
+        let mut spec_drift = current("v2", "old_spec", 900);
+        spec_drift.partition_spec_id = 2;
+        assert_eq!(
+            selector.classify(&spec_drift),
+            Some(SelectionReason::ObsoletePartitionSpec)
+        );
+
+        let mut schema_drift = current("v2", "old_schema", 900);
+        schema_drift.schema_id = 6;
+        assert_eq!(
+            selector.classify(&schema_drift),
+            Some(SelectionReason::ObsoleteSchema)
+        );
+
+        // Precedence: a file that qualifies under every reason at once reports
+        // the highest-precedence one, and peeling each cause off in order walks
+        // the precedence down exactly one step at a time.
+        let mut all_at_once = current("v1", "everything", 1801);
+        all_at_once.schema_id = 6;
+        all_at_once.partition_spec_id = 2;
+        all_at_once.sort_order_id = Some(4);
+        let expected = [
+            SelectionReason::ObsoleteSchema,
+            SelectionReason::ObsoletePartitionSpec,
+            SelectionReason::ObsoleteSortOrder,
+            SelectionReason::ObsoleteWriterRecipe,
+            SelectionReason::Oversized,
+        ];
+        let mut observed = Vec::new();
+        for step in 0..expected.len() {
+            observed.push(selector.classify(&all_at_once).unwrap());
+            match step {
+                0 => all_at_once.schema_id = 7,
+                1 => all_at_once.partition_spec_id = 3,
+                2 => all_at_once.sort_order_id = Some(5),
+                3 => {
+                    all_at_once.file_path =
+                        "s3://bucket/data/forge/v2/part-0/everything.parquet".to_owned();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(observed, expected);
+        // With every identity cause removed it is merely oversized, and
+        // shrinking it below the ceiling makes it healthy.
+        all_at_once.file_size_in_bytes = 900;
+        assert_eq!(selector.classify(&all_at_once), None);
+
+        // A path with no recipe segment can never match the current recipe.
+        let mut foreign = current("v2", "foreign", 900);
+        foreign.file_path = "s3://bucket/elsewhere/foreign.parquet".to_owned();
+        assert_eq!(
+            selector.classify(&foreign),
+            Some(SelectionReason::ObsoleteWriterRecipe)
+        );
+
+        // Individually actionable reasons never share a group.
+        let groups = selector
+            .select(vec![
+                schema_drift.clone(),
+                spec_drift.clone(),
+                current("v2", "tiny_a", 100),
+                current("v2", "tiny_b", 100),
+            ])
+            .unwrap();
+        for group in &groups {
+            if group.reason.is_individually_actionable() {
+                assert_eq!(group.files.len(), 1, "{:?} must stand alone", group.reason);
+            }
+        }
+        let packed: Vec<&SelectionGroup> = groups
+            .iter()
+            .filter(|group| group.reason == SelectionReason::Undersized)
+            .collect();
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].files.len(), 2);
+    }
+
+    #[test]
+    fn wyrd_selection_policy_preserves_partition_spec_and_open_tail_rules() {
+        let selector = IdentityAwareSelector::new(policy()).unwrap();
+
+        // Undersized files never accumulate across a partition boundary...
+        let mut other_partition = current("v2", "other_a", 100);
+        other_partition.partition_key = "part-1".to_owned();
+        let mut other_partition_b = current("v2", "other_b", 100);
+        other_partition_b.partition_key = "part-1".to_owned();
+        let groups = selector
+            .select(vec![
+                current("v2", "a", 100),
+                current("v2", "b", 100),
+                other_partition.clone(),
+                other_partition_b.clone(),
+            ])
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        for group in &groups {
+            let keys: BTreeSet<&str> = group
+                .files
+                .iter()
+                .map(|file| file.partition_key.as_str())
+                .collect();
+            assert_eq!(keys.len(), 1, "a group never spans partitions");
+        }
+
+        // ...nor across a partition-spec boundary, even at the same partition
+        // value: the two specs describe different physical layouts.
+        let mut other_spec = current("v2", "spec_a", 100);
+        other_spec.partition_spec_id = 3;
+        let mut legacy_spec = current("v2", "spec_b", 100);
+        legacy_spec.partition_spec_id = 2;
+        let mut legacy_spec_peer = current("v2", "spec_c", 100);
+        legacy_spec_peer.partition_spec_id = 2;
+        let groups = selector
+            .select(vec![other_spec, legacy_spec, legacy_spec_peer])
+            .unwrap();
+        for group in &groups {
+            let specs: BTreeSet<i32> = group
+                .files
+                .iter()
+                .map(|file| file.partition_spec_id)
+                .collect();
+            assert_eq!(specs.len(), 1, "a group never spans partition specs");
+        }
+
+        // A pending run is emitted before it would cross target.
+        let selector = IdentityAwareSelector::new(policy()).unwrap();
+        let groups = selector
+            .select(vec![
+                current("v2", "p0", 390),
+                current("v2", "p1", 390),
+                current("v2", "p2", 390),
+                current("v2", "p3", 390),
+            ])
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        for group in &groups {
+            assert_eq!(group.files.len(), 2);
+            assert!(group.total_bytes() <= 1000);
+        }
+
+        // A lone undersized file is never emitted: it has nothing to merge with.
+        let groups = selector.select(vec![current("v2", "lonely", 100)]).unwrap();
+        assert!(groups.is_empty());
+
+        // An open partition's tail stays live...
+        let open = WyrdSelectionPolicy {
+            open_partitions: OpenPartitionPolicy::Open(BTreeSet::from(["part-0".to_owned()])),
+            ..policy()
+        };
+        let selector_open = IdentityAwareSelector::new(open.clone()).unwrap();
+        let tail = vec![current("v2", "t0", 100), current("v2", "t1", 100)];
+        assert!(
+            selector_open.select(tail.clone()).unwrap().is_empty(),
+            "an under-target tail of an open partition is left to grow"
+        );
+
+        // ...unless it already reaches target on its own, in which case there
+        // is nothing to gain by waiting for more peers.
+        let selector_open_small_target = IdentityAwareSelector::new(WyrdSelectionPolicy {
+            target_file_size_bytes: 700,
+            ..open.clone()
+        })
+        .unwrap();
+        let full_tail = vec![current("v2", "t0", 399), current("v2", "t1", 399)];
+        assert_eq!(
+            selector_open_small_target.select(full_tail).unwrap().len(),
+            1
+        );
+
+        // ...or the caller opts into emitting open tails...
+        let selector_forced = IdentityAwareSelector::new(WyrdSelectionPolicy {
+            emit_open_partition_tail: true,
+            ..open.clone()
+        })
+        .unwrap();
+        assert_eq!(selector_forced.select(tail.clone()).unwrap().len(), 1);
+
+        // ...or the partition is closed.
+        assert_eq!(selector.select(tail).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wyrd_selection_policy_rejects_duplicate_or_stale_manifest_identities() {
+        // Two reasons for one identity make the persisted reason ambiguous.
+        let duplicate = SelectionReport::new(
+            SelectionStrategyKind::WyrdIdentityAware,
+            42,
+            None,
+            vec![
+                SelectedFile {
+                    file_path: "a.parquet".to_owned(),
+                    reason: SelectionReason::Undersized,
+                },
+                SelectedFile {
+                    file_path: "a.parquet".to_owned(),
+                    reason: SelectionReason::Oversized,
+                },
+            ],
+        );
+        assert!(matches!(duplicate, Err(CompactionError::Config(_))));
+
+        // A report is sorted and stable regardless of insertion order.
+        let report = SelectionReport::new(
+            SelectionStrategyKind::UpstreamFull,
+            42,
+            None,
+            vec![
+                SelectedFile {
+                    file_path: "b.parquet".to_owned(),
+                    reason: SelectionReason::UpstreamFull,
+                },
+                SelectedFile {
+                    file_path: "a.parquet".to_owned(),
+                    reason: SelectionReason::UpstreamFull,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.selected_paths(), vec!["a.parquet", "b.parquet"]);
+
+        // Unknown reasons are rejected rather than reinterpreted.
+        assert!(SelectionReason::parse("NotAReason").is_err());
+        for reason in [
+            SelectionReason::ObsoleteSchema,
+            SelectionReason::ObsoletePartitionSpec,
+            SelectionReason::ObsoleteSortOrder,
+            SelectionReason::ObsoleteWriterRecipe,
+            SelectionReason::Oversized,
+            SelectionReason::Undersized,
+            SelectionReason::UpstreamSmallFiles,
+            SelectionReason::UpstreamFull,
+            SelectionReason::UpstreamFilesWithDeletes,
+        ] {
+            assert_eq!(SelectionReason::parse(reason.as_str()).unwrap(), reason);
+        }
+
+        // An inconsistent policy is rejected before it can select anything.
+        assert!(
+            IdentityAwareSelector::new(WyrdSelectionPolicy {
+                target_file_size_bytes: 0,
+                ..policy()
+            })
+            .is_err()
+        );
+        assert!(
+            IdentityAwareSelector::new(WyrdSelectionPolicy {
+                small_file_threshold_bytes: 1000,
+                ..policy()
+            })
+            .is_err()
+        );
+        assert!(
+            WyrdSelectionPolicy {
+                target_file_size_bytes: u64::MAX,
+                ..policy()
+            }
+            .max_file_size_bytes()
+            .is_err()
+        );
+
+        // Every reason a group can carry round-trips into the report.
+        let selector = IdentityAwareSelector::new(policy()).unwrap();
+        let mut schema_drift = current("v2", "schema", 900);
+        schema_drift.schema_id = 6;
+        let groups = selector
+            .select(vec![
+                schema_drift,
+                current("v2", "x", 100),
+                current("v2", "y", 100),
+            ])
+            .unwrap();
+        let report = selector.report(42, &groups).unwrap();
+        assert_eq!(report.base_snapshot_id, 42);
+        assert_eq!(report.strategy, SelectionStrategyKind::WyrdIdentityAware);
+        assert_eq!(report.policy.as_ref().unwrap().max_file_size_bytes, 1800);
+        assert_eq!(report.selected.len(), 3);
+    }
+}
