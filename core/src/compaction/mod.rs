@@ -1549,6 +1549,7 @@ impl CompactionPlanner {
             CompactionPlanningConfig::FilesWithDeletes(_) => {
                 SelectionStrategyKind::UpstreamFilesWithDeletes
             }
+            CompactionPlanningConfig::Auto(_) => SelectionStrategyKind::UpstreamAuto,
             CompactionPlanningConfig::WyrdIdentityAware(_) => {
                 SelectionStrategyKind::WyrdIdentityAware
             }
@@ -1587,6 +1588,10 @@ impl CompactionPlanner {
     /// them. Only the *choice* of which tasks to keep, and how to group them,
     /// comes from the policy — joined onto the scan by exact data-file path.
     ///
+    /// The delete-cleanup lower bound is derived from the complete scan, exactly
+    /// as the upstream pipeline derives it, because it describes the snapshot's
+    /// live data rather than the files this policy selected.
+    ///
     /// # Errors
     ///
     /// Returns an error when the policy is inconsistent, when manifest identity
@@ -1596,7 +1601,7 @@ impl CompactionPlanner {
         table: &Table,
         snapshot_id: i64,
         config: &crate::config::WyrdIdentityAwareConfig,
-    ) -> Result<Vec<FileGroup>> {
+    ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         let selector = IdentityAwareSelector::new(config.policy.clone())?;
         let index =
             ManifestIdentityIndex::load(table, snapshot_id, config.policy.event_time_field_id)
@@ -1604,6 +1609,7 @@ impl CompactionPlanner {
         let groups = selector.select(index.identities())?;
 
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
         let mut tasks_by_path: HashMap<String, FileScanTask> = tasks
             .into_iter()
             .map(|task| (task.data_file_path.clone(), task))
@@ -1626,7 +1632,7 @@ impl CompactionPlanner {
             file_groups.push(FileGroup::new(selected).with_calculated_parallelism(&self.config)?);
         }
 
-        Ok(file_groups)
+        Ok((file_groups, min_sequence))
     }
 }
 
@@ -1655,7 +1661,7 @@ mod tests {
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
@@ -1668,10 +1674,13 @@ mod tests {
     };
     use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
     use crate::config::{
-        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
-        SmallFilesConfigBuilder,
+        CompactionConfigBuilder, CompactionExecutionConfig, CompactionExecutionConfigBuilder,
+        CompactionPlanningConfig, SmallFilesConfigBuilder,
     };
-    use crate::executor::{ExecutorType, RewriteFilesStat};
+    use crate::error::CompactionError;
+    use crate::executor::{
+        CompactionExecutor, DataFusionExecutor, ExecutorType, RewriteFilesRequest, RewriteFilesStat,
+    };
 
     mod file_group_scope;
 
@@ -3192,5 +3201,739 @@ mod tests {
             !custom.contains_key("partitions.date=2024-01-01"),
             "Partition keys must be filtered out"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Managed execution and identity-aware selection
+    // ------------------------------------------------------------------
+
+    /// Catalog wrapper that serves reads and refuses every mutation.
+    ///
+    /// Planning and rewriting must be pure with respect to the catalog: they
+    /// read a snapshot and produce candidate outputs, and the decision to
+    /// publish belongs to the caller alone. A double that merely *counts*
+    /// mutations could still let one through; this one makes any mutation an
+    /// immediate, attributable failure.
+    #[derive(Debug)]
+    struct ReadOnlyCatalog {
+        inner: Arc<dyn Catalog>,
+    }
+
+    impl ReadOnlyCatalog {
+        fn new(inner: Arc<dyn Catalog>) -> Self {
+            Self { inner }
+        }
+
+        fn refuse<T>(operation: &str) -> iceberg::Result<T> {
+            Err(iceberg::Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("read-only catalog refused mutation: {operation}"),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for ReadOnlyCatalog {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+
+        async fn create_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            Self::refuse("create_namespace")
+        }
+
+        async fn get_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+
+        async fn update_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            Self::refuse("update_namespace")
+        }
+
+        async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            Self::refuse("drop_namespace")
+        }
+
+        async fn list_tables(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+
+        async fn create_table(
+            &self,
+            _namespace: &NamespaceIdent,
+            _creation: TableCreation,
+        ) -> iceberg::Result<Table> {
+            Self::refuse("create_table")
+        }
+
+        async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+            self.inner.load_table(table).await
+        }
+
+        async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            Self::refuse("drop_table")
+        }
+
+        async fn purge_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            Self::refuse("purge_table")
+        }
+
+        async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+
+        async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> iceberg::Result<()> {
+            Self::refuse("rename_table")
+        }
+
+        async fn register_table(
+            &self,
+            _table: &TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<Table> {
+            Self::refuse("register_table")
+        }
+
+        async fn update_table(&self, _commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+            Self::refuse("update_table")
+        }
+    }
+
+    /// Observer that records every event for later assertion.
+    #[derive(Debug, Default)]
+    struct RecordingRewriteObserver {
+        events: std::sync::Mutex<Vec<crate::managed::RewriteEvent>>,
+    }
+
+    impl RecordingRewriteObserver {
+        fn events(&self) -> Vec<crate::managed::RewriteEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn terminal(&self) -> Option<crate::managed::RewriteEvent> {
+            self.events()
+                .into_iter()
+                .find(crate::managed::RewriteEvent::is_terminal)
+        }
+    }
+
+    impl crate::managed::RewriteObserver for RecordingRewriteObserver {
+        fn on_event(&self, event: crate::managed::RewriteEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// Writes `count` small data files under a Forge-shaped data location.
+    ///
+    /// The path shape matters: the identity-aware policy recovers the writer
+    /// recipe from `/data/forge/<recipe>/`, so files written anywhere else
+    /// would classify as recipe drift and never exercise the size path.
+    async fn write_forge_files(
+        table: &Table,
+        warehouse_location: &str,
+        recipe: &str,
+        prefix: &str,
+        count: usize,
+    ) -> Vec<DataFile> {
+        let data_location = format!("{warehouse_location}/data/forge/{recipe}");
+        let mut all = Vec::new();
+        for index in 0..count {
+            let location_generator =
+                DefaultLocationGenerator::with_data_location(data_location.clone());
+            let file_name_generator = DefaultFileNameGenerator::new(
+                "data".to_owned(),
+                Some(format!("{prefix}_{index}")),
+                iceberg::spec::DataFileFormat::Parquet,
+            );
+            let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(
+                    WriterProperties::builder().build(),
+                    table.metadata().current_schema().clone(),
+                ),
+                table.file_io().clone(),
+                location_generator,
+                file_name_generator,
+            );
+            // Stamping the current sort order is what a real Wyrd writer does;
+            // without it every file would read as sort-order drift.
+            let mut writer = DataFileWriterBuilder::new(rolling_writer_builder)
+                .sort_order_id(Some(table.metadata().default_sort_order().order_id as i32))
+                .build(None)
+                .await
+                .unwrap();
+            writer
+                .write(create_test_record_batch(&simple_table_schema()))
+                .await
+                .unwrap();
+            all.extend(writer.close().await.unwrap());
+        }
+        all
+    }
+
+    /// Builds a policy whose "current" identity is the table's own.
+    fn forge_policy(
+        table: &Table,
+        recipe: &str,
+        target: u64,
+        threshold: u64,
+    ) -> crate::managed::WyrdSelectionPolicy {
+        crate::managed::WyrdSelectionPolicy {
+            schema_id: table.metadata().current_schema_id(),
+            partition_spec_id: table.metadata().default_partition_spec_id(),
+            sort_order_id: table.metadata().default_sort_order().order_id as i32,
+            writer_recipe: recipe.to_owned(),
+            recipe_resolver: crate::managed::WriterRecipeResolver::forge(),
+            target_file_size_bytes: target,
+            small_file_threshold_bytes: threshold,
+            open_partitions: crate::managed::OpenPartitionPolicy::AllClosed,
+            emit_open_partition_tail: false,
+            event_time_field_id: None,
+        }
+    }
+
+    /// Builds a rewrite request straight against the executor.
+    ///
+    /// Bypassing `rewrite_plan` is deliberate for the failure case: it is the
+    /// only way to hand the writer an unusable output location without
+    /// corrupting the table under test.
+    fn rewrite_request_for(
+        table: &Table,
+        plan: &CompactionPlan,
+        execution_config: Arc<CompactionExecutionConfig>,
+        data_location: String,
+    ) -> RewriteFilesRequest {
+        RewriteFilesRequest {
+            file_io: table.file_io().clone(),
+            schema: table.metadata().current_schema().clone(),
+            file_group: plan.file_group.clone(),
+            execution_config,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+            metrics_recorder: None,
+            location_generator: DefaultLocationGenerator::with_data_location(data_location),
+            sort_order: None,
+            format_version: table.metadata().format_version(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wyrd_selection_report_is_complete_unique_and_matches_plans() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "sel", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                &table, "v2", 2_000_000, 1_000_000,
+            )),
+        ));
+        let (plans, report) = planner
+            .plan_compaction_with_report(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.strategy,
+            crate::managed::SelectionStrategyKind::WyrdIdentityAware
+        );
+        assert_eq!(
+            report.base_snapshot_id,
+            table.metadata().current_snapshot().unwrap().snapshot_id()
+        );
+        assert!(!plans.is_empty(), "four small files must produce a plan");
+
+        // The report is exactly the set of files the plans will rewrite:
+        // nothing extra, nothing missing, no duplicates.
+        let mut planned: Vec<String> = plans
+            .iter()
+            .flat_map(|plan| plan.file_group.data_files.iter())
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        planned.sort();
+        let reported: Vec<String> = report
+            .selected_paths()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(reported, planned);
+
+        let unique: std::collections::BTreeSet<&String> = planned.iter().collect();
+        assert_eq!(unique.len(), planned.len(), "no identity appears twice");
+
+        // Small current-identity files are packed, not rewritten one by one.
+        for entry in &report.selected {
+            assert_eq!(entry.reason, crate::managed::SelectionReason::Undersized);
+        }
+
+        // The declared policy travels with the report.
+        let policy = report.policy.as_ref().unwrap();
+        assert_eq!(policy.writer_recipe, "v2");
+        assert_eq!(policy.target_file_size_bytes, 2_000_000);
+        assert_eq!(policy.max_file_size_bytes, 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn managed_plan_and_rewrite_never_mutate_catalog() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "ro", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let read_only: Arc<dyn Catalog> =
+            Arc::new(ReadOnlyCatalog::new(env.catalog.clone() as Arc<dyn Catalog>));
+        let observer = Arc::new(RecordingRewriteObserver::default());
+        let context = crate::managed::ManagedExecutionContext::builder()
+            .with_observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let compaction = CompactionBuilder::new(read_only, env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .planning(CompactionPlanningConfig::WyrdIdentityAware(
+                        crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                            &table, "v2", 2_000_000, 1_000_000,
+                        )),
+                    ))
+                    .build()
+                    .unwrap(),
+            ))
+            .with_executor(Box::new(DataFusionExecutor::with_context(context)))
+            .build();
+
+        // Planning reads only.
+        let (plans, report) = compaction.plan_compaction_with_report().await.unwrap();
+        assert!(!plans.is_empty());
+        assert!(!report.selected.is_empty());
+
+        // Rewriting reads and writes objects, but never touches the catalog.
+        let execution_config =
+            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+        let result = compaction
+            .rewrite_plan(plans[0].clone(), &execution_config, &table)
+            .await
+            .unwrap();
+        assert!(!result.output_data_files.is_empty());
+
+        // The catalog's own view is untouched: same snapshot, same files.
+        let reloaded = env.catalog.load_table(&env.table_ident).await.unwrap();
+        assert_eq!(
+            reloaded
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id(),
+            table.metadata().current_snapshot().unwrap().snapshot_id()
+        );
+
+        // And the refusal is real, not merely unexercised.
+        let refused = ReadOnlyCatalog::new(env.catalog.clone() as Arc<dyn Catalog>)
+            .drop_table(&env.table_ident)
+            .await;
+        assert!(refused.is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_rewrite_keeps_plan_result_and_output_compatibility() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "compat", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let planning = CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                &table, "v2", 2_000_000, 1_000_000,
+            )),
+        );
+        let config = Arc::new(
+            CompactionConfigBuilder::default()
+                .planning(planning)
+                .build()
+                .unwrap(),
+        );
+        let execution_config =
+            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+
+        // Unmanaged: the historical construction path, unchanged.
+        let unmanaged = CompactionBuilder::new(
+            env.catalog.clone() as Arc<dyn Catalog>,
+            env.table_ident.clone(),
+        )
+        .with_config(config.clone())
+        .build();
+        let unmanaged_plans = unmanaged.plan_compaction().await.unwrap();
+        let unmanaged_result = unmanaged
+            .rewrite_plan(unmanaged_plans[0].clone(), &execution_config, &table)
+            .await
+            .unwrap();
+
+        // Managed: same plans, same result shape, same rows.
+        let observer = Arc::new(RecordingRewriteObserver::default());
+        let context = crate::managed::ManagedExecutionContext::builder()
+            .with_observer(observer.clone())
+            .build()
+            .unwrap();
+        let managed = CompactionBuilder::new(
+            env.catalog.clone() as Arc<dyn Catalog>,
+            env.table_ident.clone(),
+        )
+        .with_config(config)
+        .with_executor(Box::new(DataFusionExecutor::with_context(context)))
+        .build();
+        let managed_plans = managed.plan_compaction().await.unwrap();
+        let managed_result = managed
+            .rewrite_plan(managed_plans[0].clone(), &execution_config, &table)
+            .await
+            .unwrap();
+
+        assert_eq!(managed_plans.len(), unmanaged_plans.len());
+        assert_eq!(
+            managed_plans[0].file_count(),
+            unmanaged_plans[0].file_count()
+        );
+        assert_eq!(
+            managed_plans[0].total_bytes(),
+            unmanaged_plans[0].total_bytes()
+        );
+        assert_eq!(
+            managed_result.stats.input_files_count,
+            unmanaged_result.stats.input_files_count
+        );
+        assert_eq!(
+            managed_result.stats.output_files_count,
+            unmanaged_result.stats.output_files_count
+        );
+
+        let managed_rows: u64 = managed_result
+            .output_data_files
+            .iter()
+            .map(iceberg::spec::DataFile::record_count)
+            .sum();
+        let unmanaged_rows: u64 = unmanaged_result
+            .output_data_files
+            .iter()
+            .map(iceberg::spec::DataFile::record_count)
+            .sum();
+        assert_eq!(managed_rows, unmanaged_rows);
+        assert!(managed_rows > 0);
+
+        // Observation is additive, never a substitute for the returned result.
+        assert!(matches!(
+            observer.terminal(),
+            Some(crate::managed::RewriteEvent::Succeeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_executor_uses_injected_runtime_and_isolated_sessions() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "iso", 6).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let observer = Arc::new(RecordingRewriteObserver::default());
+        let spill_dir = TempDir::new().unwrap();
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::FairSpillPool::new(64 * 1024 * 1024),
+        );
+        let context = crate::managed::ManagedExecutionContext::builder()
+            .with_memory_pool(pool, Some(64 * 1024 * 1024))
+            .with_spill_lease(
+                crate::managed::SpillLease::new(spill_dir.path().to_path_buf()).unwrap(),
+            )
+            .with_observer(observer.clone())
+            .build()
+            .unwrap();
+
+        // The leased runtime is the one the executor runs on.
+        let runtime_a = context.runtime_env();
+        assert!(Arc::ptr_eq(&runtime_a, &context.runtime_env()));
+        assert_eq!(context.pool_capacity_bytes(), Some(64 * 1024 * 1024));
+        assert_eq!(context.peak_memory_bytes(), 0, "nothing reserved yet");
+
+        let executor = DataFusionExecutor::with_context(Arc::clone(&context));
+        let compaction = CompactionBuilder::new(
+            env.catalog.clone() as Arc<dyn Catalog>,
+            env.table_ident.clone(),
+        )
+        .with_config(Arc::new(
+            CompactionConfigBuilder::default()
+                .planning(CompactionPlanningConfig::WyrdIdentityAware(
+                    crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                        &table, "v2", 2_000_000, 1_000_000,
+                    )),
+                ))
+                .build()
+                .unwrap(),
+        ))
+        .with_executor(Box::new(executor))
+        .build();
+
+        let plans = compaction.plan_compaction().await.unwrap();
+        assert!(!plans.is_empty());
+        let execution_config =
+            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+
+        // Two rewrites over the same leased runtime. Isolated sessions mean
+        // both can register their tables under the same names; a shared
+        // session would collide or cross-contaminate.
+        for plan in plans.iter().take(2) {
+            let result = compaction
+                .rewrite_plan(plan.clone(), &execution_config, &table)
+                .await
+                .unwrap();
+            assert!(!result.output_data_files.is_empty());
+        }
+
+        // The leased pool actually served the work.
+        assert!(
+            context.peak_memory_bytes() > 0,
+            "the injected pool must be the one that served the reservations"
+        );
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::managed::RewriteEvent::PeakMemory { .. })),
+            "peak memory is reported for every attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_executor_cancellation_drains_all_writer_tasks_and_reports_outputs() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "cancel", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let observer = Arc::new(RecordingRewriteObserver::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = crate::managed::ManagedExecutionContext::builder()
+            .with_cancellation(token.clone())
+            .with_observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let compaction = CompactionBuilder::new(
+            env.catalog.clone() as Arc<dyn Catalog>,
+            env.table_ident.clone(),
+        )
+        .with_config(Arc::new(
+            CompactionConfigBuilder::default()
+                .planning(CompactionPlanningConfig::WyrdIdentityAware(
+                    crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                        &table, "v2", 2_000_000, 1_000_000,
+                    )),
+                ))
+                .build()
+                .unwrap(),
+        ))
+        .with_executor(Box::new(DataFusionExecutor::with_context(Arc::clone(
+            &context,
+        ))))
+        .build();
+
+        let plans = compaction.plan_compaction().await.unwrap();
+        let execution_config =
+            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+
+        // Cancel before the rewrite starts: every writer stops at its first
+        // read, and the attempt still returns rather than hanging on a task.
+        token.cancel();
+        let error = compaction
+            .rewrite_plan(plans[0].clone(), &execution_config, &table)
+            .await
+            .err()
+            .expect("a cancelled attempt must not report success");
+
+        let CompactionError::Cancelled {
+            attempt_id,
+            outputs,
+        } = error
+        else {
+            panic!("cancellation must surface as its own typed outcome, got {error:?}");
+        };
+        assert_eq!(attempt_id, context.attempt_id().to_string());
+
+        // Exactly one terminal event, and it names the same outputs.
+        let terminals: Vec<crate::managed::RewriteEvent> = observer
+            .events()
+            .into_iter()
+            .filter(crate::managed::RewriteEvent::is_terminal)
+            .collect();
+        assert_eq!(terminals.len(), 1, "one terminal event per attempt");
+        let crate::managed::RewriteEvent::Cancelled {
+            outputs: reported, ..
+        } = &terminals[0]
+        else {
+            panic!(
+                "expected a cancellation terminal event, got {:?}",
+                terminals[0]
+            );
+        };
+        assert_eq!(reported, &outputs);
+
+        // Every reported output is attributable and ordinal-unique, whether or
+        // not its close settled.
+        let ordinals: std::collections::BTreeSet<u64> = outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        assert_eq!(ordinals.len(), outputs.len());
+        for output in &outputs {
+            assert!(!output.path.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_executor_reports_peak_memory_spill_and_every_terminal_outcome() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "term", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let planning = CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                &table, "v2", 2_000_000, 1_000_000,
+            )),
+        );
+        let config = Arc::new(
+            CompactionConfigBuilder::default()
+                .planning(planning)
+                .build()
+                .unwrap(),
+        );
+        let execution_config =
+            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+
+        let planner = CompactionPlanner::new(config.planning.clone());
+        let plans = planner
+            .plan_compaction_with_branch(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert!(!plans.is_empty());
+
+        // Success, with resource accounting.
+        let spill_dir = TempDir::new().unwrap();
+        let success_observer = Arc::new(RecordingRewriteObserver::default());
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::FairSpillPool::new(64 * 1024 * 1024),
+        );
+        let success_context = crate::managed::ManagedExecutionContext::builder()
+            .with_memory_pool(pool, Some(64 * 1024 * 1024))
+            .with_spill_lease(
+                crate::managed::SpillLease::new(spill_dir.path().to_path_buf()).unwrap(),
+            )
+            .with_observer(success_observer.clone())
+            .build()
+            .unwrap();
+        let executor = DataFusionExecutor::with_context(success_context);
+        let response = executor
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config.clone(),
+                format!("{}/data/forge/v3", env.warehouse_location),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.data_files.is_empty());
+
+        let success_events = success_observer.events();
+        assert!(
+            success_events
+                .iter()
+                .any(|event| matches!(event, crate::managed::RewriteEvent::PeakMemory { peak_bytes, .. } if *peak_bytes > 0)),
+            "a completed rewrite reports a non-zero peak against the leased pool"
+        );
+        assert!(
+            success_events
+                .iter()
+                .any(|event| matches!(event, crate::managed::RewriteEvent::ScratchSpill { .. })),
+            "a leased scratch root is always accounted for"
+        );
+        assert!(
+            success_events
+                .iter()
+                .any(|event| matches!(event, crate::managed::RewriteEvent::OutputOpened { .. })),
+            "every output open is reported"
+        );
+        assert!(matches!(
+            success_observer.terminal(),
+            Some(crate::managed::RewriteEvent::Succeeded { .. })
+        ));
+
+        // Failure: a projection the input files cannot satisfy fails the
+        // rewrite, and the attempt still reports exactly one terminal event.
+        let failure_observer = Arc::new(RecordingRewriteObserver::default());
+        let failure_context = crate::managed::ManagedExecutionContext::builder()
+            .with_observer(failure_observer.clone())
+            .build()
+            .unwrap();
+        let failing = DataFusionExecutor::with_context(failure_context);
+        let mut failing_request = rewrite_request_for(
+            &table,
+            &plans[0],
+            execution_config.clone(),
+            format!("{}/data/forge/v5", env.warehouse_location),
+        );
+        failing_request.schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(99)
+                .with_fields(vec![
+                    NestedField::required(99, "absent_column", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let failure = failing.rewrite_files(failing_request).await;
+        assert!(
+            failure.is_err(),
+            "a rewrite whose projection the inputs cannot satisfy must fail"
+        );
+        assert!(matches!(
+            failure_observer.terminal(),
+            Some(crate::managed::RewriteEvent::Failed { .. })
+        ));
+
+        // Cancellation: the third and final terminal outcome.
+        let cancel_observer = Arc::new(RecordingRewriteObserver::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancel_context = crate::managed::ManagedExecutionContext::builder()
+            .with_cancellation(token)
+            .with_observer(cancel_observer.clone())
+            .build()
+            .unwrap();
+        let cancelling = DataFusionExecutor::with_context(cancel_context);
+        let cancelled = cancelling
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config,
+                format!("{}/data/forge/v4", env.warehouse_location),
+            ))
+            .await;
+        assert!(matches!(cancelled, Err(CompactionError::Cancelled { .. })));
+        assert!(matches!(
+            cancel_observer.terminal(),
+            Some(crate::managed::RewriteEvent::Cancelled { .. })
+        ));
     }
 }

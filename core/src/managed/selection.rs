@@ -60,6 +60,8 @@ pub enum SelectionReason {
     UpstreamFull,
     /// Selected by upstream's files-with-deletes policy.
     UpstreamFilesWithDeletes,
+    /// Selected by upstream's unified auto-planning policy.
+    UpstreamAuto,
 }
 
 impl SelectionReason {
@@ -79,6 +81,7 @@ impl SelectionReason {
             Self::UpstreamSmallFiles => "UpstreamSmallFiles",
             Self::UpstreamFull => "UpstreamFull",
             Self::UpstreamFilesWithDeletes => "UpstreamFilesWithDeletes",
+            Self::UpstreamAuto => "UpstreamAuto",
         }
     }
 
@@ -100,6 +103,7 @@ impl SelectionReason {
             "UpstreamSmallFiles" => Ok(Self::UpstreamSmallFiles),
             "UpstreamFull" => Ok(Self::UpstreamFull),
             "UpstreamFilesWithDeletes" => Ok(Self::UpstreamFilesWithDeletes),
+            "UpstreamAuto" => Ok(Self::UpstreamAuto),
             other => Err(CompactionError::Config(format!(
                 "unknown selection reason '{other}'"
             ))),
@@ -140,6 +144,8 @@ pub enum SelectionStrategyKind {
     UpstreamFull,
     /// Upstream files-with-deletes policy.
     UpstreamFilesWithDeletes,
+    /// Upstream unified auto-planning policy.
+    UpstreamAuto,
     /// The core-owned identity-aware policy.
     WyrdIdentityAware,
 }
@@ -152,6 +158,7 @@ impl SelectionStrategyKind {
             Self::UpstreamSmallFiles => "UpstreamSmallFiles",
             Self::UpstreamFull => "UpstreamFull",
             Self::UpstreamFilesWithDeletes => "UpstreamFilesWithDeletes",
+            Self::UpstreamAuto => "UpstreamAuto",
             Self::WyrdIdentityAware => "WyrdIdentityAware",
         }
     }
@@ -166,6 +173,7 @@ impl SelectionStrategyKind {
             Self::UpstreamSmallFiles => Some(SelectionReason::UpstreamSmallFiles),
             Self::UpstreamFull => Some(SelectionReason::UpstreamFull),
             Self::UpstreamFilesWithDeletes => Some(SelectionReason::UpstreamFilesWithDeletes),
+            Self::UpstreamAuto => Some(SelectionReason::UpstreamAuto),
             Self::WyrdIdentityAware => None,
         }
     }
@@ -692,8 +700,9 @@ impl IdentityAwareSelector {
             return;
         }
         let partition_open = policy.open_partitions.is_open(partition_key);
-        let worth_emitting =
-            !partition_open || policy.emit_open_partition_tail || bytes >= policy.target_file_size_bytes;
+        let worth_emitting = !partition_open
+            || policy.emit_open_partition_tail
+            || bytes >= policy.target_file_size_bytes;
         if worth_emitting {
             groups.push(SelectionGroup {
                 files,
@@ -993,11 +1002,8 @@ mod tests {
     #[test]
     fn wyrd_selection_policy_rejects_duplicate_or_stale_manifest_identities() {
         // Two reasons for one identity make the persisted reason ambiguous.
-        let duplicate = SelectionReport::new(
-            SelectionStrategyKind::WyrdIdentityAware,
-            42,
-            None,
-            vec![
+        let duplicate =
+            SelectionReport::new(SelectionStrategyKind::WyrdIdentityAware, 42, None, vec![
                 SelectedFile {
                     file_path: "a.parquet".to_owned(),
                     reason: SelectionReason::Undersized,
@@ -1006,26 +1012,20 @@ mod tests {
                     file_path: "a.parquet".to_owned(),
                     reason: SelectionReason::Oversized,
                 },
-            ],
-        );
+            ]);
         assert!(matches!(duplicate, Err(CompactionError::Config(_))));
 
         // A report is sorted and stable regardless of insertion order.
-        let report = SelectionReport::new(
-            SelectionStrategyKind::UpstreamFull,
-            42,
-            None,
-            vec![
-                SelectedFile {
-                    file_path: "b.parquet".to_owned(),
-                    reason: SelectionReason::UpstreamFull,
-                },
-                SelectedFile {
-                    file_path: "a.parquet".to_owned(),
-                    reason: SelectionReason::UpstreamFull,
-                },
-            ],
-        )
+        let report = SelectionReport::new(SelectionStrategyKind::UpstreamFull, 42, None, vec![
+            SelectedFile {
+                file_path: "b.parquet".to_owned(),
+                reason: SelectionReason::UpstreamFull,
+            },
+            SelectedFile {
+                file_path: "a.parquet".to_owned(),
+                reason: SelectionReason::UpstreamFull,
+            },
+        ])
         .unwrap();
         assert_eq!(report.selected_paths(), vec!["a.parquet", "b.parquet"]);
 
@@ -1041,6 +1041,7 @@ mod tests {
             SelectionReason::UpstreamSmallFiles,
             SelectionReason::UpstreamFull,
             SelectionReason::UpstreamFilesWithDeletes,
+            SelectionReason::UpstreamAuto,
         ] {
             assert_eq!(SelectionReason::parse(reason.as_str()).unwrap(), reason);
         }
