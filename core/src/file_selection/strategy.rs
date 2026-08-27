@@ -496,6 +496,26 @@ impl std::fmt::Display for BinPackGroupingStrategy {
     }
 }
 
+/// File filter that selects nothing.
+///
+/// Used where a strategy value is structurally required but no upstream
+/// selection is correct. Producing zero plans is always safe; producing the
+/// wrong plans is not.
+#[derive(Debug)]
+pub struct RejectAllFilterStrategy;
+
+impl FileFilterStrategy for RejectAllFilterStrategy {
+    fn filter(&self, _data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        Vec::new()
+    }
+}
+
+impl std::fmt::Display for RejectAllFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RejectAll")
+    }
+}
+
 /// File filter by size threshold.
 ///
 /// Filters by `task.length`.
@@ -897,6 +917,19 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
             CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
                 PlanStrategy::from_files_with_deletes(deletes_config)
             }
+            // The identity-aware policy is not expressible as a filter/group
+            // pipeline: its precedence is stateful and its grouping is ordered.
+            // `CompactionPlanner` routes it to `IdentityAwareSelector` before
+            // this conversion is ever reached. Any other caller that lands here
+            // gets a strategy that selects nothing — the only inert value that
+            // cannot be mistaken for upstream semantics. Selecting everything,
+            // or filtering by size, would silently produce plans the policy
+            // never authorised.
+            CompactionPlanningConfig::WyrdIdentityAware(_) => PlanStrategy::new(
+                vec![Box::new(RejectAllFilterStrategy)],
+                GroupingStrategyEnum::Single(SingleGroupingStrategy),
+                vec![],
+            ),
         }
     }
 }

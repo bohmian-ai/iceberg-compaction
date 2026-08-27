@@ -52,6 +52,10 @@ impl AutoSelectedStrategy {
                 Some(AutoSelectedStrategy::SmallFiles)
             }
             crate::config::CompactionPlanningConfig::Full(_) => None,
+            // Auto-selection chooses between the upstream heuristics. The
+            // identity-aware policy is a deliberate caller choice, never
+            // something auto mode substitutes in or out.
+            crate::config::CompactionPlanningConfig::WyrdIdentityAware(_) => None,
         }
     }
 }
