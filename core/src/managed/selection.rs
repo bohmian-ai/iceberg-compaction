@@ -692,8 +692,9 @@ impl IdentityAwareSelector {
             return;
         }
         let partition_open = policy.open_partitions.is_open(partition_key);
-        let worth_emitting =
-            !partition_open || policy.emit_open_partition_tail || bytes >= policy.target_file_size_bytes;
+        let worth_emitting = !partition_open
+            || policy.emit_open_partition_tail
+            || bytes >= policy.target_file_size_bytes;
         if worth_emitting {
             groups.push(SelectionGroup {
                 files,
@@ -993,11 +994,8 @@ mod tests {
     #[test]
     fn wyrd_selection_policy_rejects_duplicate_or_stale_manifest_identities() {
         // Two reasons for one identity make the persisted reason ambiguous.
-        let duplicate = SelectionReport::new(
-            SelectionStrategyKind::WyrdIdentityAware,
-            42,
-            None,
-            vec![
+        let duplicate =
+            SelectionReport::new(SelectionStrategyKind::WyrdIdentityAware, 42, None, vec![
                 SelectedFile {
                     file_path: "a.parquet".to_owned(),
                     reason: SelectionReason::Undersized,
@@ -1006,26 +1004,20 @@ mod tests {
                     file_path: "a.parquet".to_owned(),
                     reason: SelectionReason::Oversized,
                 },
-            ],
-        );
+            ]);
         assert!(matches!(duplicate, Err(CompactionError::Config(_))));
 
         // A report is sorted and stable regardless of insertion order.
-        let report = SelectionReport::new(
-            SelectionStrategyKind::UpstreamFull,
-            42,
-            None,
-            vec![
-                SelectedFile {
-                    file_path: "b.parquet".to_owned(),
-                    reason: SelectionReason::UpstreamFull,
-                },
-                SelectedFile {
-                    file_path: "a.parquet".to_owned(),
-                    reason: SelectionReason::UpstreamFull,
-                },
-            ],
-        )
+        let report = SelectionReport::new(SelectionStrategyKind::UpstreamFull, 42, None, vec![
+            SelectedFile {
+                file_path: "b.parquet".to_owned(),
+                reason: SelectionReason::UpstreamFull,
+            },
+            SelectedFile {
+                file_path: "a.parquet".to_owned(),
+                reason: SelectionReason::UpstreamFull,
+            },
+        ])
         .unwrap();
         assert_eq!(report.selected_paths(), vec!["a.parquet", "b.parquet"]);
 

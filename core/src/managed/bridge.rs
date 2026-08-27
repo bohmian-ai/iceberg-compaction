@@ -16,9 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use iceberg::writer::file_writer::rolling_writer::{
-    RollingWriterEvent, RollingWriterObserver,
-};
+use iceberg::writer::file_writer::rolling_writer::{RollingWriterEvent, RollingWriterObserver};
 
 use super::observer::{AttemptId, OutputIdentity, RewriteEvent, RewriteObserver};
 

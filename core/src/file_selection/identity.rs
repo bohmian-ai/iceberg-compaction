@@ -116,10 +116,7 @@ impl ManifestIdentityIndex {
 /// stored as integral literals. Any other literal type yields `None` rather
 /// than a lossy coercion: a wrong ordering key is worse than no ordering key,
 /// because the fallback ordering is still total.
-fn bound_as_i64(
-    bounds: &HashMap<i32, iceberg::spec::Datum>,
-    field_id: i32,
-) -> Option<i64> {
+fn bound_as_i64(bounds: &HashMap<i32, iceberg::spec::Datum>, field_id: i32) -> Option<i64> {
     match bounds.get(&field_id)?.literal() {
         PrimitiveLiteral::Long(value) => Some(*value),
         PrimitiveLiteral::Int(value) => Some(i64::from(*value)),

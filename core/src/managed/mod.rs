@@ -24,11 +24,11 @@ pub use bridge::{AttemptLedger, RollingObserverBridge};
 pub use context::{
     ManagedExecutionContext, ManagedExecutionContextBuilder, PeakTrackingMemoryPool, SpillLease,
 };
+pub use observer::{
+    AttemptId, NoopRewriteObserver, OutputIdentity, RewriteEvent, RewriteObserver, noop_observer,
+};
 pub use selection::{
     CandidateIdentity, IdentityAwareSelector, OpenPartitionPolicy, PolicyIdentity, SelectedFile,
     SelectionGroup, SelectionReason, SelectionReport, SelectionStrategyKind, WriterRecipeResolver,
     WyrdSelectionPolicy,
-};
-pub use observer::{
-    AttemptId, NoopRewriteObserver, OutputIdentity, RewriteEvent, RewriteObserver, noop_observer,
 };
