@@ -1130,6 +1130,19 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
             CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
                 PlanStrategy::from_files_with_deletes(deletes_config)
             }
+            // The identity-aware policy is not expressible as a filter/group
+            // pipeline: its precedence is stateful and its grouping is ordered.
+            // `CompactionPlanner` routes it to `IdentityAwareSelector` before
+            // this conversion is ever reached. Any other caller that lands here
+            // gets a strategy that selects nothing — the only inert value that
+            // cannot be mistaken for upstream semantics. Selecting everything,
+            // or filtering by size, would silently produce plans the policy
+            // never authorised.
+            CompactionPlanningConfig::WyrdIdentityAware(_) => PlanStrategy::new(
+                vec![Box::new(MatchNoneFileFilter)],
+                GroupingStrategyEnum::Single(SingleGroupingStrategy),
+                vec![],
+            ),
         }
     }
 }

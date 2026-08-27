@@ -364,6 +364,49 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
+/// Configuration for the core-owned, identity-aware selection strategy.
+///
+/// Unlike the upstream strategies this one is not a filter over sizes: the
+/// policy decides which files are obsolete, oversized, or packable, and the
+/// core owns the grouping. The shared parallelism and partition knobs are
+/// carried here so the variant satisfies the same planning contract as the
+/// upstream variants.
+#[derive(Debug, Clone)]
+pub struct WyrdIdentityAwareConfig {
+    /// Immutable identity and sizing inputs the caller declared.
+    pub policy: crate::managed::selection::WyrdSelectionPolicy,
+
+    /// Minimum bytes a partition must hold before it is planned.
+    pub min_size_per_partition: u64,
+
+    /// Maximum data files a single partition may contribute to one plan.
+    pub max_file_count_per_partition: usize,
+
+    /// Maximum parallelism for input (reading) operations.
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    pub max_output_parallelism: usize,
+
+    /// Whether output parallelism is chosen heuristically.
+    pub enable_heuristic_output_parallelism: bool,
+}
+
+impl WyrdIdentityAwareConfig {
+    /// Creates a config from a policy, defaulting the shared planning knobs.
+    #[must_use]
+    pub fn new(policy: crate::managed::selection::WyrdSelectionPolicy) -> Self {
+        Self {
+            policy,
+            min_size_per_partition: DEFAULT_MIN_SIZE_PER_PARTITION,
+            max_file_count_per_partition: DEFAULT_MAX_FILE_COUNT_PER_PARTITION,
+            max_input_parallelism: available_parallelism().get() * 4,
+            max_output_parallelism: available_parallelism().get(),
+            enable_heuristic_output_parallelism: true,
+        }
+    }
+}
+
 /// Planning configuration variants for different compaction strategies.
 #[derive(Debug, Clone)]
 pub enum CompactionPlanningConfig {
@@ -371,6 +414,8 @@ pub enum CompactionPlanningConfig {
     SmallFiles(SmallFilesConfig),
     Full(FullCompactionConfig),
     FilesWithDeletes(FilesWithDeletesConfig),
+    /// Core-owned identity-aware selection. See [`WyrdIdentityAwareConfig`].
+    WyrdIdentityAware(WyrdIdentityAwareConfig),
 }
 
 impl CompactionPlanningConfig {
@@ -381,6 +426,9 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_file_sequence_number,
             Self::Full(c) => c.max_file_sequence_number,
             Self::FilesWithDeletes(c) => c.max_file_sequence_number,
+            // The identity-aware policy selects by manifest identity, never by
+            // a file sequence bound.
+            Self::WyrdIdentityAware(_) => None,
         }
     }
 
@@ -391,6 +439,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.target_file_size_bytes,
             Self::Full(c) => c.target_file_size_bytes,
             Self::FilesWithDeletes(c) => c.target_file_size_bytes,
+            Self::WyrdIdentityAware(c) => c.policy.target_file_size_bytes,
         }
     }
 
@@ -401,6 +450,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.min_size_per_partition,
             Self::Full(c) => c.min_size_per_partition,
             Self::FilesWithDeletes(c) => c.min_size_per_partition,
+            Self::WyrdIdentityAware(c) => c.min_size_per_partition,
         }
     }
 
@@ -411,6 +461,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_file_count_per_partition,
             Self::Full(c) => c.max_file_count_per_partition,
             Self::FilesWithDeletes(c) => c.max_file_count_per_partition,
+            Self::WyrdIdentityAware(c) => c.max_file_count_per_partition,
         }
     }
 
@@ -421,6 +472,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_input_parallelism,
             Self::Full(c) => c.max_input_parallelism,
             Self::FilesWithDeletes(c) => c.max_input_parallelism,
+            Self::WyrdIdentityAware(c) => c.max_input_parallelism,
         }
     }
 
@@ -431,6 +483,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_output_parallelism,
             Self::Full(c) => c.max_output_parallelism,
             Self::FilesWithDeletes(c) => c.max_output_parallelism,
+            Self::WyrdIdentityAware(c) => c.max_output_parallelism,
         }
     }
 
@@ -441,6 +494,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
             Self::Full(c) => c.enable_heuristic_output_parallelism,
             Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
+            Self::WyrdIdentityAware(c) => c.enable_heuristic_output_parallelism,
         }
     }
 
@@ -451,6 +505,9 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.file_group_scope,
             Self::Full(c) => c.file_group_scope,
             Self::FilesWithDeletes(c) => c.file_group_scope,
+            // The identity-aware policy owns its own partition isolation, so
+            // the upstream file-group scope does not apply to it.
+            Self::WyrdIdentityAware(_) => FileGroupScope::Partition,
         }
     }
 }

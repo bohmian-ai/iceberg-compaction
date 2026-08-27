@@ -20,9 +20,11 @@ use iceberg::table::Table;
 
 use crate::Result;
 
+pub mod identity;
 pub mod packer;
 pub mod strategy;
 
+pub use identity::ManifestIdentityIndex;
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
