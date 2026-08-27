@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
+use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -35,7 +36,10 @@ use crate::executor::{
     ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
 };
-use crate::file_selection::{FileGroup, FileSelector};
+use crate::file_selection::{FileGroup, FileSelector, ManifestIdentityIndex};
+use crate::managed::selection::{
+    IdentityAwareSelector, SelectedFile, SelectionReport, SelectionStrategyKind,
+};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
 mod validator;
@@ -469,6 +473,31 @@ impl Compaction {
                 "CompactionConfig is required for planning".to_owned(),
             ))
         }
+    }
+
+    /// Generates compaction plans together with the durable selection report.
+    ///
+    /// The additive counterpart to [`plan_compaction`](Self::plan_compaction):
+    /// same plans, plus the complete account of why each file is in them. The
+    /// caller persists the report in its durable plan before an attempt exists,
+    /// so a later attempt is checkable against the decision that authorised it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no config is set, when the table cannot be loaded,
+    /// or when planning or report construction fails.
+    pub async fn plan_compaction_with_report(
+        &self,
+    ) -> Result<(Vec<CompactionPlan>, SelectionReport)> {
+        let Some(config) = &self.config else {
+            return Err(CompactionError::Execution(
+                "CompactionConfig is required for planning".to_owned(),
+            ));
+        };
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        CompactionPlanner::new(config.planning.clone())
+            .plan_compaction_with_report(&table, &self.to_branch)
+            .await
     }
 
     /// Commits multiple rewrite results in a single Iceberg transaction.
@@ -1443,9 +1472,94 @@ impl CompactionPlanner {
         self.plan_compaction_with_branch(table, MAIN_BRANCH).await
     }
 
+    /// Plans compaction and returns the plans together with a complete account
+    /// of why each file was selected.
+    ///
+    /// The report is the durable half of a plan: the caller persists it before
+    /// any attempt exists, so an attempt can be checked against the decision
+    /// that authorised it. Every path in the report appears in exactly one
+    /// returned plan, and every data file in the returned plans appears in the
+    /// report — so a plan/report disagreement is detectable rather than latent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the branch snapshot is missing, when manifest
+    /// identity cannot be read, when the policy is inconsistent, or when the
+    /// report would contain a duplicate identity.
+    pub async fn plan_compaction_with_report(
+        &self,
+        table: &Table,
+        to_branch: &str,
+    ) -> Result<(Vec<CompactionPlan>, SelectionReport)> {
+        let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) else {
+            return Err(CompactionError::Execution(format!(
+                "branch '{to_branch}' has no snapshot to plan from"
+            )));
+        };
+        let snapshot_id = branch_snapshot.snapshot_id();
+
+        let plans = self.plan_compaction_with_branch(table, to_branch).await?;
+
+        let report = match &self.config {
+            CompactionPlanningConfig::WyrdIdentityAware(config) => {
+                // Re-derive the reasons from the same immutable inputs the
+                // plans were built from. Recomputation, not a side channel:
+                // a reason that cannot be re-derived from the snapshot is a
+                // reason that cannot be audited later.
+                let selector = IdentityAwareSelector::new(config.policy.clone())?;
+                let index = ManifestIdentityIndex::load(
+                    table,
+                    snapshot_id,
+                    config.policy.event_time_field_id,
+                )
+                .await?;
+                let groups = selector.select(index.identities())?;
+                selector.report(snapshot_id, &groups)?
+            }
+            other => {
+                let strategy = Self::upstream_strategy_kind(other);
+                let reason = strategy
+                    .uniform_reason()
+                    .expect("upstream strategies always declare a uniform reason");
+                let selected = plans
+                    .iter()
+                    .flat_map(|plan| plan.file_group.data_files.iter())
+                    .map(|task| SelectedFile {
+                        file_path: task.data_file_path.clone(),
+                        reason,
+                    })
+                    .collect();
+                SelectionReport::new(strategy, snapshot_id, None, selected)?
+            }
+        };
+
+        Ok((plans, report))
+    }
+
+    /// Maps an upstream planning config to its report strategy.
+    ///
+    /// # Panics
+    ///
+    /// Never: the identity-aware variant is handled by its own branch before
+    /// this is reached, and the fallback preserves that invariant explicitly.
+    fn upstream_strategy_kind(config: &CompactionPlanningConfig) -> SelectionStrategyKind {
+        match config {
+            CompactionPlanningConfig::SmallFiles(_) => SelectionStrategyKind::UpstreamSmallFiles,
+            CompactionPlanningConfig::Full(_) => SelectionStrategyKind::UpstreamFull,
+            CompactionPlanningConfig::FilesWithDeletes(_) => {
+                SelectionStrategyKind::UpstreamFilesWithDeletes
+            }
+            CompactionPlanningConfig::WyrdIdentityAware(_) => {
+                SelectionStrategyKind::WyrdIdentityAware
+            }
+        }
+    }
+
     /// Customization point for file grouping logic.
     ///
-    /// Default implementation uses `FileStrategy`. Override for custom behavior.
+    /// Upstream configs run the filter/grouping pipeline. The identity-aware
+    /// config is routed to its own selector instead: its precedence is stateful
+    /// and its grouping is ordered, neither of which the pipeline can express.
     async fn group_files_for_compaction(
         &self,
         table: &Table,
@@ -1453,11 +1567,66 @@ impl CompactionPlanner {
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
+        if let CompactionPlanningConfig::WyrdIdentityAware(config) = &self.config {
+            return self
+                .group_files_by_identity(table, snapshot_id, config)
+                .await;
+        }
+
         let strategy = PlanStrategy::from(&self.config);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
         let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
         Ok((file_groups, min_sequence))
+    }
+
+    /// Groups files using the core-owned identity-aware policy.
+    ///
+    /// The scan is still the source of the tasks, so delete attachment,
+    /// projection, and deletion-vector handling stay exactly as upstream built
+    /// them. Only the *choice* of which tasks to keep, and how to group them,
+    /// comes from the policy — joined onto the scan by exact data-file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy is inconsistent, when manifest identity
+    /// cannot be read, or when parallelism calculation fails for a group.
+    async fn group_files_by_identity(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        config: &crate::config::WyrdIdentityAwareConfig,
+    ) -> Result<Vec<FileGroup>> {
+        let selector = IdentityAwareSelector::new(config.policy.clone())?;
+        let index =
+            ManifestIdentityIndex::load(table, snapshot_id, config.policy.event_time_field_id)
+                .await?;
+        let groups = selector.select(index.identities())?;
+
+        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let mut tasks_by_path: HashMap<String, FileScanTask> = tasks
+            .into_iter()
+            .map(|task| (task.data_file_path.clone(), task))
+            .collect();
+
+        let mut file_groups = Vec::with_capacity(groups.len());
+        for group in groups {
+            // A selected identity with no scan task means the snapshot moved
+            // under us between the manifest read and the scan. Skipping it is
+            // correct: planning a file the scan will not produce would build a
+            // group the executor cannot read.
+            let selected: Vec<FileScanTask> = group
+                .files
+                .iter()
+                .filter_map(|file| tasks_by_path.remove(&file.file_path))
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            file_groups.push(FileGroup::new(selected).with_calculated_parallelism(&self.config)?);
+        }
+
+        Ok(file_groups)
     }
 }
 
