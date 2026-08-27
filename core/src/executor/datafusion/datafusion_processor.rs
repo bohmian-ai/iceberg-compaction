@@ -57,7 +57,7 @@ pub struct DatafusionProcessor {
 }
 
 impl DatafusionProcessor {
-    /// Builds a processor that owns its own DataFusion runtime.
+    /// Builds a processor that owns its own `DataFusion` runtime.
     ///
     /// The runtime is bounded only when the execution config declares a memory
     /// budget; otherwise the pool is unbounded and nothing spills.

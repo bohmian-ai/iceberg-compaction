@@ -67,7 +67,7 @@ impl AttemptLedger {
         let guard = self.outputs.lock().expect("attempt ledger lock poisoned");
         let mut outputs: Vec<OutputIdentity> = guard.values().cloned().collect();
         drop(guard);
-        outputs.sort_by(|left, right| left.logical_ordinal.cmp(&right.logical_ordinal));
+        outputs.sort_by_key(|output| output.logical_ordinal);
         outputs
     }
 

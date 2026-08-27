@@ -3421,8 +3421,7 @@ mod tests {
         let error = compaction
             .rewrite_plan(plans[0].clone(), &execution_config, &table)
             .await
-            .err()
-            .expect("a cancelled attempt must not report success");
+            .expect_err("a cancelled attempt must not report success");
 
         let CompactionError::Cancelled {
             attempt_id,
