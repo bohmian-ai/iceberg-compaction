@@ -20,10 +20,12 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod file_selection;
+pub mod managed;
 
 pub use config::{AutoCompactionConfig, CompactionConfig};
 pub use error::{CompactionError, Result};
 pub use executor::CompactionExecutor;
+pub use managed::{ManagedExecutionContext, RewriteEvent, RewriteObserver};
 // Re-export iceberg related crates
 pub use iceberg;
 // pub use iceberg_catalog_memory;

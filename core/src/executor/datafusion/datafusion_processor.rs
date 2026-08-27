@@ -58,11 +58,22 @@ pub struct DatafusionProcessor {
 }
 
 impl DatafusionProcessor {
+    /// Builds a processor over an optional caller-supplied runtime.
+    ///
+    /// `runtime` is either a managed attempt's leased runtime or the executor's
+    /// shared pod-wide runtime; either already carries the memory pool and
+    /// scratch root the caller accounts for. With `None`, the processor builds a
+    /// bounded spilling runtime when the execution config declares a budget, and
+    /// otherwise uses an unbounded pool that never spills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionError::DataFusion`] when the runtime cannot be built.
     pub fn new(
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
-        shared_runtime: Option<Arc<RuntimeEnv>>,
+        runtime: Option<Arc<RuntimeEnv>>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
@@ -73,15 +84,14 @@ impl DatafusionProcessor {
             );
 
         // Memory-pool selection, in priority order:
-        // 1. `shared_runtime` (built once and shared across all concurrent
-        //    `rewrite_files` calls on a single executor) — makes `max_memory_bytes`
-        //    a *pod-wide* ceiling instead of a per-plan one. See
-        //    `DataFusionExecutor::shared_runtime_env`.
+        // 1. `runtime`: a managed attempt's leased runtime, or the executor's
+        //    shared runtime that makes `max_memory_bytes` a *pod-wide* ceiling
+        //    instead of a per-plan one. See `DataFusionExecutor::shared_runtime_env`.
         // 2. else a per-call bounded `FairSpillPool` + OS `DiskManager` when a
         //    budget is configured, so blocking operators (notably `SortExec`) spill
         //    to disk once they exceed the budget instead of OOM-killing the process.
         // 3. else the previous behavior: an unbounded pool and no spilling.
-        let ctx = match shared_runtime {
+        let ctx = match runtime {
             Some(runtime_env) => Arc::new(SessionContext::new_with_config_rt(
                 session_config,
                 runtime_env,

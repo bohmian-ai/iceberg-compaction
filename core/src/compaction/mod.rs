@@ -87,6 +87,7 @@ pub struct CompactionBuilder {
     catalog_name: Option<Cow<'static, str>>,
     config: Option<Arc<CompactionConfig>>,
     executor_type: Option<ExecutorType>,
+    executor: Option<Box<dyn CompactionExecutor>>,
     registry: Option<BoxedRegistry>,
     commit_retry_config: Option<CommitManagerRetryConfig>,
     to_branch: Option<Cow<'static, str>>,
@@ -102,6 +103,7 @@ impl CompactionBuilder {
             catalog_name: None,
             config: None,
             executor_type: None,
+            executor: None,
             registry: None,
             commit_retry_config: None,
             to_branch: None,
@@ -126,6 +128,19 @@ impl CompactionBuilder {
         self
     }
 
+    /// Injects an already-constructed executor.
+    ///
+    /// This is how a caller binds compaction to resources it owns — a leased
+    /// runtime, a memory budget, a scratch root, a cancellation token — without
+    /// the core deciding any of them. It takes precedence over
+    /// [`with_executor_type`](Self::with_executor_type), which remains the
+    /// construction path for callers that have no such resources to lease.
+    #[must_use]
+    pub fn with_executor(mut self, executor: Box<dyn CompactionExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
     /// Sets the metrics registry. Defaults to `NoopMetricsRegistry`.
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
         self.registry = Some(registry);
@@ -146,8 +161,9 @@ impl CompactionBuilder {
 
     /// Builds the `Compaction` instance with configured values.
     pub fn build(self) -> Compaction {
-        let executor_type = self.executor_type.unwrap_or(ExecutorType::DataFusion);
-        let executor = create_compaction_executor(executor_type);
+        let executor = self.executor.unwrap_or_else(|| {
+            create_compaction_executor(self.executor_type.unwrap_or(ExecutorType::DataFusion))
+        });
 
         let metrics = if let Some(registry) = self.registry {
             Arc::new(Metrics::new(registry))
