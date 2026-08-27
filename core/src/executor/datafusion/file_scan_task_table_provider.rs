@@ -93,7 +93,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.file_scan_tasks.clone(),
             self.file_type,
             self.schema.clone(),
-            projection,
+            projection.map(Vec::as_slice),
             filters,
             &self.file_io,
             self.need_seq_num,

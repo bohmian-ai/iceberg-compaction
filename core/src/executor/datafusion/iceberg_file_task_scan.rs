@@ -23,10 +23,11 @@ use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
@@ -164,7 +165,7 @@ impl IcebergFileTaskScan {
         file_scan_tasks: Vec<FileScanTask>,
         file_type: DataContentType,
         schema: ArrowSchemaRef,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         file_io: &FileIO,
         need_seq_num: bool,
@@ -334,6 +335,13 @@ impl ExecutionPlan for IcebergFileTaskScan {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -703,7 +711,7 @@ impl DisplayAs for IcebergFileTaskScan {
 
 pub fn get_column_names(
     schema: ArrowSchemaRef,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
 ) -> Option<Vec<String>> {
     projection.map(|v| {
         v.iter()

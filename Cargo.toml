@@ -14,22 +14,22 @@ async-trait = "0.1.89"
 
 # Data processing and storage
 ctor = "0.2.8"
-datafusion = "54.1"
+datafusion = "55.0.0"
 
 # Local workspace members
 futures = "0.3.17"
 # Managed Wyrd fork: minimal patch set over RisingWave dev_rebase_main_20260807 5d8df5e5f0508b31f2ada532dc861e97820f96af.
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55" }
-iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55" }
-iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55" }
-iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734" }
+iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734" }
+iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734" }
+iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55" }
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "702b27c28fcde43ccdda64f29a4ef3ecc042de55", features = [
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734" }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "5ad9a89f2e667583770b9db3126c0323d35f8734", features = [
     "opendal-s3",
 ] }
 
-parquet = { version = "58.4", features = ["async"] }
+parquet = { version = "59.2", features = ["async"] }
 port_scanner = "0.1.5"
 rand = "0.9.0"
 
