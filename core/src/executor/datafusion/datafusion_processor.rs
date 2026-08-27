@@ -57,10 +57,52 @@ pub struct DatafusionProcessor {
 }
 
 impl DatafusionProcessor {
+    /// Builds a processor that owns its own DataFusion runtime.
+    ///
+    /// The runtime is bounded only when the execution config declares a memory
+    /// budget; otherwise the pool is unbounded and nothing spills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionError::DataFusion`] when the runtime cannot be built.
     pub fn new(
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
+    ) -> Result<Self> {
+        Self::build(execution_config, executor_parallelism, file_io, None)
+    }
+
+    /// Builds a processor over a runtime the caller leased.
+    ///
+    /// Each call produces an isolated [`SessionContext`] over that one shared
+    /// runtime, so concurrent rewrites register their tables independently
+    /// while still drawing on a single memory and disk budget. The private
+    /// spilling-runtime path is bypassed entirely: the caller's runtime already
+    /// carries the pool and scratch root that the attempt is accountable for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionError::DataFusion`] when the session cannot be built.
+    pub fn new_with_runtime_env(
+        execution_config: Arc<CompactionExecutionConfig>,
+        executor_parallelism: usize,
+        file_io: FileIO,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Result<Self> {
+        Self::build(
+            execution_config,
+            executor_parallelism,
+            file_io,
+            Some(runtime_env),
+        )
+    }
+
+    fn build(
+        execution_config: Arc<CompactionExecutionConfig>,
+        executor_parallelism: usize,
+        file_io: FileIO,
+        leased_runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
@@ -76,8 +118,15 @@ impl DatafusionProcessor {
         // they exceed the budget, instead of buffering all decoded Arrow data
         // in memory and OOM-killing the process. With no budget we keep the
         // previous behavior: an unbounded pool and no spilling.
-        let ctx = match execution_config.max_memory_bytes {
-            Some(max_memory_bytes) if max_memory_bytes > 0 => {
+        let ctx = match (leased_runtime_env, execution_config.max_memory_bytes) {
+            // A leased runtime wins outright: it already encodes the caller's
+            // budget and scratch lease, and rebuilding one here would spill
+            // somewhere the lease does not account for.
+            (Some(runtime_env), _) => Arc::new(SessionContext::new_with_config_rt(
+                session_config,
+                runtime_env,
+            )),
+            (None, Some(max_memory_bytes)) if max_memory_bytes > 0 => {
                 let runtime_env = build_spilling_runtime_env(
                     max_memory_bytes,
                     execution_config.spill_dir.as_deref(),
@@ -87,7 +136,7 @@ impl DatafusionProcessor {
                     runtime_env,
                 ))
             }
-            _ => Arc::new(SessionContext::new_with_config(session_config)),
+            (None, _) => Arc::new(SessionContext::new_with_config(session_config)),
         };
 
         let table_register = DatafusionTableRegister::new(

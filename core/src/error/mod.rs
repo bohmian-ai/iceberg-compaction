@@ -41,6 +41,20 @@ pub enum CompactionError {
 
     #[error("Compaction unexpected failed: {0}")]
     Unexpected(String),
+
+    /// A managed attempt was cancelled by its caller and fully drained.
+    ///
+    /// `outputs` names every object the attempt produced or may have produced.
+    /// It is evidence, not a deletion instruction: the caller owns whether an
+    /// unpublished object is reclaimed, retained, or reconciled against a
+    /// commit whose outcome is uncertain.
+    #[error("Compaction attempt {attempt_id} was cancelled with {} output(s)", outputs.len())]
+    Cancelled {
+        /// Identity of the cancelled attempt.
+        attempt_id: String,
+        /// Every produced or possibly-produced output.
+        outputs: Vec<crate::managed::observer::OutputIdentity>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;
