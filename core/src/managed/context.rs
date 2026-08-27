@@ -1,7 +1,7 @@
 //! Caller-bound execution context for exactly one managed rewrite attempt.
 //!
 //! The context carries the resources a caller leases to the core for the
-//! duration of one publication attempt: the DataFusion runtime, a memory pool
+//! duration of one publication attempt: the `DataFusion` runtime, a memory pool
 //! whose peak is tracked, a scratch root whose lifetime and byte usage the
 //! caller owns, a cancellation token, and the rewrite observer.
 //!
@@ -158,7 +158,7 @@ impl SpillLease {
 
     /// Re-measures the bytes currently resident under the root.
     ///
-    /// Recursion is bounded by the directory tree DataFusion itself creates, so
+    /// Recursion is bounded by the directory tree `DataFusion` itself creates, so
     /// this is a shallow walk in practice. Entries that vanish between listing
     /// and stat are skipped rather than failing the attempt: a spill file being
     /// reclaimed mid-measurement is normal, not an error.
@@ -232,7 +232,7 @@ impl ManagedExecutionContext {
         self.attempt_id
     }
 
-    /// Returns the leased DataFusion runtime.
+    /// Returns the leased `DataFusion` runtime.
     ///
     /// Every rewrite builds its own isolated session over this one runtime, so
     /// the memory and disk budget is shared while session catalog state is not.
