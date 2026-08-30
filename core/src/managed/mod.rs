@@ -15,11 +15,14 @@
 //! garbage collection: those belong to the caller, and moving any of them into
 //! the core would make the core the authority on someone else's data.
 
+pub mod boundary;
 pub mod bridge;
 pub mod context;
+pub mod dependency_universe;
 pub mod observer;
 pub mod selection;
 
+pub use boundary::NonCommittingCompaction;
 pub use bridge::{AttemptLedger, RollingObserverBridge};
 pub use context::{
     ManagedExecutionContext, ManagedExecutionContextBuilder, PeakTrackingMemoryPool, SpillLease,
