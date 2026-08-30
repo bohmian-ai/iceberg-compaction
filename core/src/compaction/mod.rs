@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
-use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -30,6 +29,7 @@ use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
+use crate::compaction::identity_plan::{JoinedGroup, join_groups_to_tasks};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
@@ -38,10 +38,11 @@ use crate::executor::{
 };
 use crate::file_selection::{FileGroup, FileSelector, ManifestIdentityIndex};
 use crate::managed::selection::{
-    IdentityAwareSelector, SelectedFile, SelectionReport, SelectionStrategyKind,
+    IdentityAwareSelector, SelectedFile, SelectionGroup, SelectionReport, SelectionStrategyKind,
 };
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
+mod identity_plan;
 mod validator;
 
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
@@ -1477,15 +1478,17 @@ impl CompactionPlanner {
     ///
     /// The report is the durable half of a plan: the caller persists it before
     /// any attempt exists, so an attempt can be checked against the decision
-    /// that authorised it. Every path in the report appears in exactly one
-    /// returned plan, and every data file in the returned plans appears in the
-    /// report — so a plan/report disagreement is detectable rather than latent.
+    /// that authorised it. Plans and report come from one derivation, so every
+    /// path in the report appears in exactly one returned plan and every data
+    /// file in the returned plans appears in the report — a disagreement is not
+    /// merely detectable, it is unconstructible.
     ///
     /// # Errors
     ///
     /// Returns an error when the branch snapshot is missing, when manifest
-    /// identity cannot be read, when the policy is inconsistent, or when the
-    /// report would contain a duplicate identity.
+    /// identity cannot be read, when the policy is inconsistent, when
+    /// parallelism calculation fails, or when the report would contain a
+    /// duplicate identity.
     pub async fn plan_compaction_with_report(
         &self,
         table: &Table,
@@ -1498,40 +1501,39 @@ impl CompactionPlanner {
         };
         let snapshot_id = branch_snapshot.snapshot_id();
 
-        let plans = self.plan_compaction_with_branch(table, to_branch).await?;
-
-        let report = match &self.config {
-            CompactionPlanningConfig::WyrdIdentityAware(config) => {
-                // Re-derive the reasons from the same immutable inputs the
-                // plans were built from. Recomputation, not a side channel:
-                // a reason that cannot be re-derived from the snapshot is a
-                // reason that cannot be audited later.
-                let selector = IdentityAwareSelector::new(config.policy.clone())?;
-                let index = ManifestIdentityIndex::load(
-                    table,
-                    snapshot_id,
-                    config.policy.event_time_field_id,
-                )
-                .await?;
-                let groups = selector.select(index.identities())?;
-                selector.report(snapshot_id, &groups)?
-            }
-            other => {
-                let strategy = Self::upstream_strategy_kind(other);
-                let reason = strategy
-                    .uniform_reason()
-                    .expect("upstream strategies always declare a uniform reason");
-                let selected = plans
-                    .iter()
-                    .flat_map(|plan| plan.file_group.data_files.iter())
-                    .map(|task| SelectedFile {
-                        file_path: task.data_file_path.clone(),
-                        reason,
-                    })
-                    .collect();
-                SelectionReport::new(strategy, snapshot_id, None, selected)?
-            }
+        let CompactionPlanningConfig::WyrdIdentityAware(config) = &self.config else {
+            let plans = self.plan_compaction_with_branch(table, to_branch).await?;
+            let strategy = Self::upstream_strategy_kind(&self.config);
+            let reason = strategy
+                .uniform_reason()
+                .expect("upstream strategies always declare a uniform reason");
+            let selected = plans
+                .iter()
+                .flat_map(|plan| plan.file_group.data_files.iter())
+                .map(|task| SelectedFile {
+                    file_path: task.data_file_path.clone(),
+                    reason,
+                })
+                .collect();
+            let report = SelectionReport::new(strategy, snapshot_id, None, selected)?;
+            return Ok((plans, report));
         };
+
+        let selector = IdentityAwareSelector::new(config.policy.clone())?;
+        let (joined, min_sequence) =
+            Self::joined_identity_groups(table, snapshot_id, &selector, config).await?;
+
+        let mut plans = Vec::with_capacity(joined.len());
+        let mut groups: Vec<SelectionGroup> = Vec::with_capacity(joined.len());
+        for JoinedGroup { group, tasks } in joined {
+            let file_group = FileGroup::new(tasks).with_calculated_parallelism(&self.config)?;
+            plans.push(
+                CompactionPlan::new(file_group, to_branch.to_owned(), snapshot_id)
+                    .with_delete_cleanup_min_data_sequence_number(min_sequence),
+            );
+            groups.push(group);
+        }
+        let report = selector.report(snapshot_id, &groups)?;
 
         Ok((plans, report))
     }
@@ -1586,11 +1588,7 @@ impl CompactionPlanner {
     /// The scan is still the source of the tasks, so delete attachment,
     /// projection, and deletion-vector handling stay exactly as upstream built
     /// them. Only the *choice* of which tasks to keep, and how to group them,
-    /// comes from the policy — joined onto the scan by exact data-file path.
-    ///
-    /// The delete-cleanup lower bound is derived from the complete scan, exactly
-    /// as the upstream pipeline derives it, because it describes the snapshot's
-    /// live data rather than the files this policy selected.
+    /// comes from the policy.
     ///
     /// # Errors
     ///
@@ -1603,36 +1601,41 @@ impl CompactionPlanner {
         config: &crate::config::WyrdIdentityAwareConfig,
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         let selector = IdentityAwareSelector::new(config.policy.clone())?;
+        let (joined, min_sequence) =
+            Self::joined_identity_groups(table, snapshot_id, &selector, config).await?;
+        let file_groups = joined
+            .into_iter()
+            .map(|joined| FileGroup::new(joined.tasks).with_calculated_parallelism(&self.config))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((file_groups, min_sequence))
+    }
+
+    /// Runs the identity-aware policy against one snapshot and joins its groups
+    /// onto that snapshot's scan tasks.
+    ///
+    /// This is the single derivation behind both the plans and the durable
+    /// report. Running it twice would let the two disagree; running it once
+    /// makes the report a function of the plans by construction. The same scan
+    /// also yields upstream's delete-cleanup lower bound, which describes the
+    /// snapshot's live data rather than the files this policy selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is absent from the table metadata,
+    /// when manifest identity cannot be read, or when the scan fails.
+    async fn joined_identity_groups(
+        table: &Table,
+        snapshot_id: i64,
+        selector: &IdentityAwareSelector,
+        config: &crate::config::WyrdIdentityAwareConfig,
+    ) -> Result<(Vec<JoinedGroup>, Option<i64>)> {
         let index =
             ManifestIdentityIndex::load(table, snapshot_id, config.policy.event_time_field_id)
                 .await?;
         let groups = selector.select(index.identities())?;
-
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
-        let mut tasks_by_path: HashMap<String, FileScanTask> = tasks
-            .into_iter()
-            .map(|task| (task.data_file_path.clone(), task))
-            .collect();
-
-        let mut file_groups = Vec::with_capacity(groups.len());
-        for group in groups {
-            // A selected identity with no scan task means the snapshot moved
-            // under us between the manifest read and the scan. Skipping it is
-            // correct: planning a file the scan will not produce would build a
-            // group the executor cannot read.
-            let selected: Vec<FileScanTask> = group
-                .files
-                .iter()
-                .filter_map(|file| tasks_by_path.remove(&file.file_path))
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            file_groups.push(FileGroup::new(selected).with_calculated_parallelism(&self.config)?);
-        }
-
-        Ok((file_groups, min_sequence))
+        Ok((join_groups_to_tasks(groups, tasks), min_sequence))
     }
 }
 
@@ -1668,6 +1671,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use crate::compaction::identity_plan::join_groups_to_tasks;
     // Additional imports for new tests
     use crate::compaction::{
         CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
@@ -1681,6 +1685,8 @@ mod tests {
     use crate::executor::{
         CompactionExecutor, DataFusionExecutor, ExecutorType, RewriteFilesRequest, RewriteFilesStat,
     };
+    use crate::file_selection::{FileSelector, ManifestIdentityIndex};
+    use crate::managed::selection::IdentityAwareSelector;
 
     mod file_group_scope;
 
@@ -3437,16 +3443,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wyrd_selection_report_is_complete_unique_and_matches_plans() {
+    async fn wyrd_selection_report_is_canonical_and_matches_final_plans() {
         let env = create_test_env().await;
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "sel", 4).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+        let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+        let planning = CompactionPlanningConfig::WyrdIdentityAware(
             crate::config::WyrdIdentityAwareConfig::new(forge_policy(
                 &table, "v2", 2_000_000, 1_000_000,
             )),
-        ));
+        );
+        let planner = CompactionPlanner::new(planning.clone());
         let (plans, report) = planner
             .plan_compaction_with_report(&table, MAIN_BRANCH)
             .await
@@ -3456,14 +3464,18 @@ mod tests {
             report.strategy,
             crate::managed::SelectionStrategyKind::WyrdIdentityAware
         );
-        assert_eq!(
-            report.base_snapshot_id,
-            table.metadata().current_snapshot().unwrap().snapshot_id()
-        );
+        assert_eq!(report.base_snapshot_id, snapshot_id);
         assert!(!plans.is_empty(), "four small files must produce a plan");
+        for plan in &plans {
+            assert_eq!(
+                plan.snapshot_id, snapshot_id,
+                "every plan is bound to the reported snapshot"
+            );
+            assert_eq!(plan.to_branch, MAIN_BRANCH);
+        }
 
         // The report is exactly the set of files the plans will rewrite:
-        // nothing extra, nothing missing, no duplicates.
+        // nothing extra, nothing missing, no duplicates, sorted by identity.
         let mut planned: Vec<String> = plans
             .iter()
             .flat_map(|plan| plan.file_group.data_files.iter())
@@ -3476,9 +3488,33 @@ mod tests {
             .map(str::to_owned)
             .collect();
         assert_eq!(reported, planned);
+        assert_eq!(
+            report.selected.len(),
+            plans
+                .iter()
+                .map(|plan| plan.file_group.data_file_count)
+                .sum::<usize>(),
+            "report totals equal the plans' totals"
+        );
 
         let unique: std::collections::BTreeSet<&String> = planned.iter().collect();
         assert_eq!(unique.len(), planned.len(), "no identity appears twice");
+
+        // Every file of one plan carries one reason, and that reason is the
+        // one the report recorded: a plan is one selection group, not a mix.
+        let reason_by_path: HashMap<&str, crate::managed::SelectionReason> = report
+            .selected
+            .iter()
+            .map(|entry| (entry.file_path.as_str(), entry.reason))
+            .collect();
+        for plan in &plans {
+            let mut reasons: std::collections::BTreeSet<crate::managed::SelectionReason> =
+                std::collections::BTreeSet::new();
+            for task in &plan.file_group.data_files {
+                reasons.insert(reason_by_path[task.data_file_path.as_str()]);
+            }
+            assert_eq!(reasons.len(), 1, "one plan carries exactly one reason");
+        }
 
         // Small current-identity files are packed, not rewritten one by one.
         for entry in &report.selected {
@@ -3490,6 +3526,163 @@ mod tests {
         assert_eq!(policy.writer_recipe, "v2");
         assert_eq!(policy.target_file_size_bytes, 2_000_000);
         assert_eq!(policy.max_file_size_bytes, 3_600_000);
+
+        // Canonical means derived from the final plans, not re-derived beside
+        // them: an identity the scan did not produce is rewritten by no plan,
+        // so the report must not name it either.
+        let CompactionPlanningConfig::WyrdIdentityAware(config) = &planning else {
+            unreachable!("planning was constructed as identity-aware");
+        };
+        let selector = IdentityAwareSelector::new(config.policy.clone()).unwrap();
+        let index = ManifestIdentityIndex::load(&table, snapshot_id, None)
+            .await
+            .unwrap();
+        let groups = selector.select(index.identities()).unwrap();
+        let mut tasks = FileSelector::scan_data_files(&table, snapshot_id)
+            .await
+            .unwrap();
+        let dropped = tasks
+            .pop()
+            .expect("the snapshot has scan tasks")
+            .data_file_path;
+
+        let joined = join_groups_to_tasks(groups, tasks);
+        for entry in &joined {
+            assert_eq!(
+                entry.group.files.len(),
+                entry.tasks.len(),
+                "a joined group names exactly the files its plan will read"
+            );
+            assert!(
+                !entry
+                    .group
+                    .files
+                    .iter()
+                    .any(|file| file.file_path == dropped),
+                "an identity with no scan task cannot survive into the report"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wyrd_selection_refuses_unknown_or_contradictory_snapshot_evidence() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "evid", 4).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+        let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let policy = forge_policy(&table, "v2", 2_000_000, 1_000_000);
+
+        // A snapshot the table does not carry is unknown evidence, not an
+        // empty selection: planning it would silently report zero work for a
+        // table that may be full of candidates.
+        let unknown = ManifestIdentityIndex::load(&table, snapshot_id + 1_000, None).await;
+        assert!(
+            matches!(unknown, Err(CompactionError::Config(_))),
+            "an unknown snapshot must be refused, got {unknown:?}"
+        );
+
+        // A branch with no snapshot is the same refusal at the planning seam.
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(policy.clone()),
+        ));
+        let absent_branch = planner
+            .plan_compaction_with_report(&table, "no_such_branch")
+            .await;
+        assert!(
+            absent_branch.is_err(),
+            "a branch with no snapshot cannot authorise a plan"
+        );
+
+        // A report must be bound to a real snapshot. The unassigned sentinel
+        // names no snapshot, so a plan carrying it can never be checked
+        // against the state that authorised it.
+        let one = vec![crate::managed::SelectedFile {
+            file_path: "s3://b/data/forge/v2/part-0/a.parquet".to_owned(),
+            reason: crate::managed::SelectionReason::Undersized,
+        }];
+        let unbound = crate::managed::SelectionReport::new(
+            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
+            UNASSIGNED_SNAPSHOT_ID,
+            Some(policy.identity().unwrap()),
+            one.clone(),
+        );
+        assert!(
+            unbound.is_err(),
+            "a report bound to no snapshot must be refused"
+        );
+
+        // One identity, one reason. Two reasons for one file make the
+        // persisted reason ambiguous.
+        let duplicated = crate::managed::SelectionReport::new(
+            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
+            snapshot_id,
+            Some(policy.identity().unwrap()),
+            vec![one[0].clone(), crate::managed::SelectedFile {
+                file_path: one[0].file_path.clone(),
+                reason: crate::managed::SelectionReason::Oversized,
+            }],
+        );
+        assert!(duplicated.is_err(), "a duplicate identity must be refused");
+
+        // The strategy and its declared identity must agree: the identity-aware
+        // policy always records its inputs, and an upstream policy has none to
+        // record. Either mismatch makes the report describe a decision that
+        // was never taken.
+        let missing_policy = crate::managed::SelectionReport::new(
+            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
+            snapshot_id,
+            None,
+            one.clone(),
+        );
+        assert!(
+            missing_policy.is_err(),
+            "identity-aware selection must record its policy"
+        );
+        let foreign_policy = crate::managed::SelectionReport::new(
+            crate::managed::SelectionStrategyKind::UpstreamSmallFiles,
+            snapshot_id,
+            Some(policy.identity().unwrap()),
+            vec![crate::managed::SelectedFile {
+                file_path: one[0].file_path.clone(),
+                reason: crate::managed::SelectionReason::UpstreamSmallFiles,
+            }],
+        );
+        assert!(
+            foreign_policy.is_err(),
+            "an upstream strategy has no identity policy to declare"
+        );
+
+        // A reason must belong to the strategy that recorded it.
+        let foreign_reason = crate::managed::SelectionReport::new(
+            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
+            snapshot_id,
+            Some(policy.identity().unwrap()),
+            vec![crate::managed::SelectedFile {
+                file_path: one[0].file_path.clone(),
+                reason: crate::managed::SelectionReason::UpstreamFull,
+            }],
+        );
+        assert!(
+            foreign_reason.is_err(),
+            "an upstream reason cannot appear under identity-aware selection"
+        );
+
+        // An unknown wire spelling is rejected on read rather than reinterpreted.
+        assert!(crate::managed::SelectionReason::parse("NotAReason").is_err());
+        assert_eq!(
+            crate::managed::SelectionReason::parse("ObsoleteSchema").unwrap(),
+            crate::managed::SelectionReason::ObsoleteSchema
+        );
+
+        // The accepted report is the one the production path builds.
+        let (plans, report) = planner
+            .plan_compaction_with_report(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert_eq!(report.base_snapshot_id, snapshot_id);
+        for plan in &plans {
+            assert_eq!(plan.snapshot_id, report.base_snapshot_id);
+        }
     }
 
     #[tokio::test]
@@ -3643,32 +3836,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_executor_uses_injected_runtime_and_isolated_sessions() {
+    async fn wyrd_execution_uses_only_caller_admitted_resources() {
         let env = create_test_env().await;
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "iso", 6).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
 
         let observer = Arc::new(RecordingRewriteObserver::default());
         let spill_dir = TempDir::new().unwrap();
+        let lease = crate::managed::SpillLease::new(spill_dir.path().to_path_buf()).unwrap();
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
             datafusion::execution::memory_pool::FairSpillPool::new(64 * 1024 * 1024),
         );
         let context = crate::managed::ManagedExecutionContext::builder()
             .with_memory_pool(pool, Some(64 * 1024 * 1024))
-            .with_spill_lease(
-                crate::managed::SpillLease::new(spill_dir.path().to_path_buf()).unwrap(),
-            )
+            .with_spill_lease(lease.clone())
             .with_observer(observer.clone())
             .build()
             .unwrap();
 
-        // The leased runtime is the one the executor runs on.
-        let runtime_a = context.runtime_env();
-        assert!(Arc::ptr_eq(&runtime_a, &context.runtime_env()));
+        // The leased runtime is the one the executor runs on, and the leased
+        // scratch root is the only place it may spill.
+        let runtime = context.runtime_env();
+        assert!(Arc::ptr_eq(&runtime, &context.runtime_env()));
         assert_eq!(context.pool_capacity_bytes(), Some(64 * 1024 * 1024));
         assert_eq!(context.peak_memory_bytes(), 0, "nothing reserved yet");
+        assert_eq!(context.spill().unwrap().root(), spill_dir.path());
 
         let executor = DataFusionExecutor::with_context(Arc::clone(&context));
+        assert!(
+            Arc::ptr_eq(&executor.context().unwrap().runtime_env(), &runtime),
+            "the executor runs on the caller's runtime, not one it built"
+        );
         let compaction = CompactionBuilder::new(
             env.catalog.clone() as Arc<dyn Catalog>,
             env.table_ident.clone(),
@@ -3693,92 +3891,229 @@ mod tests {
 
         // Two rewrites over the same leased runtime. Isolated sessions mean
         // both can register their tables under the same names; a shared
-        // session would collide or cross-contaminate.
-        for plan in plans.iter().take(2) {
+        // session would collide or cross-contaminate. Running the same plan
+        // twice is the sharpest form of that collision.
+        for _ in 0..2 {
             let result = compaction
-                .rewrite_plan(plan.clone(), &execution_config, &table)
+                .rewrite_plan(plans[0].clone(), &execution_config, &table)
                 .await
                 .unwrap();
             assert!(!result.output_data_files.is_empty());
         }
 
-        // The leased pool actually served the work.
+        // The leased pool actually served the work, and its peak is reported
+        // against the capacity the caller admitted.
         assert!(
             context.peak_memory_bytes() > 0,
             "the injected pool must be the one that served the reservations"
         );
-        assert!(
-            observer
-                .events()
-                .iter()
-                .any(|event| matches!(event, crate::managed::RewriteEvent::PeakMemory { .. })),
-            "peak memory is reported for every attempt"
+        let peaks: Vec<(usize, Option<usize>)> = observer
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::managed::RewriteEvent::PeakMemory {
+                    peak_bytes,
+                    pool_capacity_bytes,
+                    ..
+                } => Some((peak_bytes, pool_capacity_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(peaks.len(), 2, "one peak report per completed attempt");
+        for (peak, capacity) in peaks {
+            assert!(peak > 0);
+            assert_eq!(capacity, Some(64 * 1024 * 1024));
+            assert!(peak <= 64 * 1024 * 1024, "the admitted bound was honoured");
+        }
+
+        // A caller that has already withdrawn its admission gets a refusal,
+        // not a partially executed attempt: nothing is read, nothing is
+        // opened, and there is no resource usage to account for.
+        let refused_observer = Arc::new(RecordingRewriteObserver::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let refused_context = crate::managed::ManagedExecutionContext::builder()
+            .with_cancellation(token)
+            .with_spill_lease(lease)
+            .with_observer(refused_observer.clone())
+            .build()
+            .unwrap();
+        let refusing = DataFusionExecutor::with_context(Arc::clone(&refused_context));
+        let refused = refusing
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config,
+                format!("{}/data/forge/v9", env.warehouse_location),
+            ))
+            .await;
+        let Err(CompactionError::Cancelled {
+            attempt_id,
+            outputs,
+        }) = refused
+        else {
+            panic!("a withdrawn admission must refuse, got {refused:?}");
+        };
+        assert_eq!(attempt_id, refused_context.attempt_id().to_string());
+        assert!(outputs.is_empty(), "a refused attempt opened nothing");
+        let refused_events = refused_observer.events();
+        assert_eq!(
+            refused_events.len(),
+            1,
+            "a refusal before IO reports only its terminal, got {refused_events:?}"
         );
+        assert!(refused_events[0].is_terminal());
+    }
+
+    /// Observer that withdraws the caller's admission the first time an output
+    /// is opened.
+    ///
+    /// Cancelling from inside the observer is the caller acting on its own
+    /// token, not the observer steering the core: the token belongs to the
+    /// attempt's context, and the core's decisions are unchanged by the
+    /// observation itself. It is used here because it is the only way to
+    /// cancel at a known point in the writer's life — after work has started
+    /// and before it can finish — without a timing race.
+    #[derive(Debug)]
+    struct CancelOnFirstOutput {
+        events: std::sync::Mutex<Vec<crate::managed::RewriteEvent>>,
+        token: tokio_util::sync::CancellationToken,
+    }
+
+    impl CancelOnFirstOutput {
+        /// Creates an observer bound to the attempt's cancellation token.
+        fn new(token: tokio_util::sync::CancellationToken) -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+                token,
+            }
+        }
+
+        /// Returns the events recorded so far, in emission order.
+        fn events(&self) -> Vec<crate::managed::RewriteEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::managed::RewriteObserver for CancelOnFirstOutput {
+        fn on_event(&self, event: crate::managed::RewriteEvent) {
+            let first_open = matches!(event, crate::managed::RewriteEvent::OutputOpened { .. })
+                && !self.token.is_cancelled();
+            self.events.lock().unwrap().push(event);
+            if first_open {
+                self.token.cancel();
+            }
+        }
     }
 
     #[tokio::test]
-    async fn managed_executor_cancellation_drains_all_writer_tasks_and_reports_outputs() {
+    async fn wyrd_cancellation_drains_writers_and_reports_possible_outputs() {
         let env = create_test_env().await;
-        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "cancel", 4).await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "cancel", 6).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
 
-        let observer = Arc::new(RecordingRewriteObserver::default());
         let token = tokio_util::sync::CancellationToken::new();
+        let observer = Arc::new(CancelOnFirstOutput::new(token.clone()));
         let context = crate::managed::ManagedExecutionContext::builder()
-            .with_cancellation(token.clone())
+            .with_cancellation(token)
             .with_observer(observer.clone())
             .build()
             .unwrap();
 
-        let compaction = CompactionBuilder::new(
-            env.catalog.clone() as Arc<dyn Catalog>,
-            env.table_ident.clone(),
-        )
-        .with_config(Arc::new(
-            CompactionConfigBuilder::default()
-                .planning(CompactionPlanningConfig::WyrdIdentityAware(
-                    crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                        &table, "v2", 2_000_000, 1_000_000,
-                    )),
-                ))
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
+                &table, "v2", 2_000_000, 1_000_000,
+            )),
+        ));
+        let plans = planner
+            .plan_compaction_with_branch(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert!(!plans.is_empty());
+
+        // A tiny target rolls a new output almost every batch, so the attempt
+        // is guaranteed to have opened an object before the cancel lands.
+        let execution_config = Arc::new(
+            CompactionExecutionConfigBuilder::default()
+                .target_file_size_bytes(1_u64)
                 .build()
                 .unwrap(),
-        ))
-        .with_executor(Box::new(DataFusionExecutor::with_context(Arc::clone(
-            &context,
-        ))))
-        .build();
+        );
+        let executor = DataFusionExecutor::with_context(Arc::clone(&context));
+        let cancelled = executor
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config,
+                format!("{}/data/forge/v8", env.warehouse_location),
+            ))
+            .await;
 
-        let plans = compaction.plan_compaction().await.unwrap();
-        let execution_config =
-            Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
-
-        // Cancel before the rewrite starts: every writer stops at its first
-        // read, and the attempt still returns rather than hanging on a task.
-        token.cancel();
-        let error = compaction
-            .rewrite_plan(plans[0].clone(), &execution_config, &table)
-            .await
-            .expect_err("a cancelled attempt must not report success");
-
-        let CompactionError::Cancelled {
+        let Err(CompactionError::Cancelled {
             attempt_id,
             outputs,
-        } = error
+        }) = cancelled
         else {
-            panic!("cancellation must surface as its own typed outcome, got {error:?}");
+            panic!("a cancelled attempt must not report success, got {cancelled:?}");
         };
         assert_eq!(attempt_id, context.attempt_id().to_string());
+        assert!(
+            !outputs.is_empty(),
+            "an attempt cancelled after it opened an object must report it"
+        );
 
-        // Exactly one terminal event, and it names the same outputs.
-        let terminals: Vec<crate::managed::RewriteEvent> = observer
-            .events()
+        let events = observer.events();
+
+        // Every object the attempt opened is reported as a possible output.
+        // Losing one would leave an object in storage that the caller never
+        // learns about and therefore never reclaims.
+        let opened: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::managed::RewriteEvent::OutputOpened {
+                    logical_ordinal, ..
+                } => Some(*logical_ordinal),
+                _ => None,
+            })
+            .collect();
+        let reported: std::collections::BTreeSet<u64> = outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        assert!(!opened.is_empty());
+        assert_eq!(reported, opened, "every opened output is reported");
+        assert_eq!(
+            reported.len(),
+            outputs.len(),
+            "no ordinal is reported twice"
+        );
+        for output in &outputs {
+            assert!(!output.path.is_empty());
+        }
+
+        // Drained, not detached: every writer that opened an object was closed
+        // before the attempt returned, so no task is still writing behind us.
+        let closed: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::managed::RewriteEvent::OutputClosed {
+                    logical_ordinal, ..
+                } => Some(*logical_ordinal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, opened, "every opened writer output was closed");
+
+        // Exactly one terminal event, and it names the same outputs the error
+        // carries.
+        let terminals: Vec<crate::managed::RewriteEvent> = events
             .into_iter()
             .filter(crate::managed::RewriteEvent::is_terminal)
             .collect();
         assert_eq!(terminals.len(), 1, "one terminal event per attempt");
         let crate::managed::RewriteEvent::Cancelled {
-            outputs: reported, ..
+            outputs: terminal_outputs,
+            ..
         } = &terminals[0]
         else {
             panic!(
@@ -3786,22 +4121,32 @@ mod tests {
                 terminals[0]
             );
         };
-        assert_eq!(reported, &outputs);
+        assert_eq!(terminal_outputs, &outputs);
+    }
 
-        // Every reported output is attributable and ordinal-unique, whether or
-        // not its close settled.
-        let ordinals: std::collections::BTreeSet<u64> = outputs
-            .iter()
-            .map(|output| output.logical_ordinal)
-            .collect();
-        assert_eq!(ordinals.len(), outputs.len());
-        for output in &outputs {
-            assert!(!output.path.is_empty());
+    /// Names one event variant.
+    ///
+    /// The match is exhaustive and wildcard-free on purpose: the event set is
+    /// closed, so adding a variant must break this function and force the
+    /// caller to decide what the new effect means rather than silently
+    /// dropping it.
+    fn event_name(event: &crate::managed::RewriteEvent) -> &'static str {
+        use crate::managed::RewriteEvent as E;
+        match event {
+            E::OutputOpened { .. } => "OutputOpened",
+            E::RollDecided { .. } => "RollDecided",
+            E::OutputClosed { .. } => "OutputClosed",
+            E::PeakMemory { .. } => "PeakMemory",
+            E::OperatorSpill { .. } => "OperatorSpill",
+            E::ScratchSpill { .. } => "ScratchSpill",
+            E::Succeeded { .. } => "Succeeded",
+            E::Failed { .. } => "Failed",
+            E::Cancelled { .. } => "Cancelled",
         }
     }
 
     #[tokio::test]
-    async fn managed_executor_reports_peak_memory_spill_and_every_terminal_outcome() {
+    async fn wyrd_observer_is_closed_non_semantic_and_balanced() {
         let env = create_test_env().await;
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "term", 4).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
@@ -3866,16 +4211,91 @@ mod tests {
                 .any(|event| matches!(event, crate::managed::RewriteEvent::ScratchSpill { .. })),
             "a leased scratch root is always accounted for"
         );
-        assert!(
-            success_events
+
+        // Balanced: every output the attempt opened reached a close, and the
+        // terminal event accounts for all of them as settled. A leaked active
+        // output would mean an object nobody closed and nobody reported.
+        let opened: std::collections::BTreeSet<u64> = success_events
+            .iter()
+            .filter_map(|event| match event {
+                crate::managed::RewriteEvent::OutputOpened {
+                    logical_ordinal, ..
+                } => Some(*logical_ordinal),
+                _ => None,
+            })
+            .collect();
+        let closed: std::collections::BTreeSet<u64> = success_events
+            .iter()
+            .filter_map(|event| match event {
+                crate::managed::RewriteEvent::OutputClosed {
+                    logical_ordinal, ..
+                } => Some(*logical_ordinal),
+                _ => None,
+            })
+            .collect();
+        assert!(!opened.is_empty(), "every output open is reported");
+        assert_eq!(closed, opened, "no output is left active");
+
+        let terminals: Vec<&crate::managed::RewriteEvent> = success_events
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal per attempt");
+        let crate::managed::RewriteEvent::Succeeded { outputs, .. } = terminals[0] else {
+            panic!("expected a success terminal, got {:?}", terminals[0]);
+        };
+        assert_eq!(
+            outputs
                 .iter()
-                .any(|event| matches!(event, crate::managed::RewriteEvent::OutputOpened { .. })),
-            "every output open is reported"
+                .map(|output| output.logical_ordinal)
+                .collect::<std::collections::BTreeSet<u64>>(),
+            opened,
+            "the terminal accounts for every output the attempt opened"
         );
-        assert!(matches!(
-            success_observer.terminal(),
-            Some(crate::managed::RewriteEvent::Succeeded { .. })
-        ));
+        assert!(
+            outputs.iter().all(|output| output.settled),
+            "a successful attempt settles every output it opened"
+        );
+
+        // The event set is closed: every recorded event names one known
+        // variant, and the naming itself is wildcard-free.
+        for event in &success_events {
+            assert!(!event_name(event).is_empty());
+        }
+
+        // Non-semantic: attaching the observation seam changes nothing the
+        // caller can act on. The same plan, executed unobserved, produces the
+        // same objects and the same rows.
+        let silent = DataFusionExecutor::new()
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config.clone(),
+                format!("{}/data/forge/v6", env.warehouse_location),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(silent.data_files.len(), response.data_files.len());
+        assert_eq!(
+            silent.stats.output_files_count,
+            response.stats.output_files_count
+        );
+        assert_eq!(
+            silent.stats.input_files_count,
+            response.stats.input_files_count
+        );
+        let observed_rows: u64 = response
+            .data_files
+            .iter()
+            .map(iceberg::spec::DataFile::record_count)
+            .sum();
+        let silent_rows: u64 = silent
+            .data_files
+            .iter()
+            .map(iceberg::spec::DataFile::record_count)
+            .sum();
+        assert_eq!(observed_rows, silent_rows);
+        assert!(observed_rows > 0);
 
         // Failure: a projection the input files cannot satisfy fails the
         // rewrite, and the attempt still reports exactly one terminal event.
@@ -3906,6 +4326,15 @@ mod tests {
             failure.is_err(),
             "a rewrite whose projection the inputs cannot satisfy must fail"
         );
+        assert_eq!(
+            failure_observer
+                .events()
+                .iter()
+                .filter(|event| event.is_terminal())
+                .count(),
+            1,
+            "a failed attempt reports exactly one terminal"
+        );
         assert!(matches!(
             failure_observer.terminal(),
             Some(crate::managed::RewriteEvent::Failed { .. })
@@ -3930,6 +4359,15 @@ mod tests {
             ))
             .await;
         assert!(matches!(cancelled, Err(CompactionError::Cancelled { .. })));
+        assert_eq!(
+            cancel_observer
+                .events()
+                .iter()
+                .filter(|event| event.is_terminal())
+                .count(),
+            1,
+            "a cancelled attempt reports exactly one terminal"
+        );
         assert!(matches!(
             cancel_observer.terminal(),
             Some(crate::managed::RewriteEvent::Cancelled { .. })

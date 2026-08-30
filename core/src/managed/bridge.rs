@@ -201,3 +201,169 @@ impl RollingWriterObserver for RollingObserverBridge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use iceberg::writer::file_writer::rolling_writer::RollingCloseReason;
+
+    use super::*;
+    use crate::managed::observer::RewriteObserver;
+
+    /// Observer that records every event in emission order.
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<RewriteEvent>>,
+    }
+
+    impl RecordingObserver {
+        /// Returns the events recorded so far, in emission order.
+        fn events(&self) -> Vec<RewriteEvent> {
+            self.events.lock().expect("recorder lock poisoned").clone()
+        }
+    }
+
+    impl RewriteObserver for RecordingObserver {
+        fn on_event(&self, event: RewriteEvent) {
+            self.events
+                .lock()
+                .expect("recorder lock poisoned")
+                .push(event);
+        }
+    }
+
+    /// Returns the attempt ordinal an `OutputOpened` event carries.
+    fn opened_ordinal(event: &RewriteEvent) -> Option<u64> {
+        match event {
+            RewriteEvent::OutputOpened {
+                logical_ordinal, ..
+            } => Some(*logical_ordinal),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn wyrd_output_identity_reserves_attempt_global_ordinals_before_open() {
+        let observer = Arc::new(RecordingObserver::default());
+        let attempt = AttemptId::new();
+        let ledger = AttemptLedger::new(attempt, Arc::clone(&observer) as Arc<dyn RewriteObserver>);
+
+        // Three concurrent writers, each numbering its own outputs from zero.
+        // A per-writer ordinal is not an identity: without re-stamping, writer
+        // 0's output 0 and writer 1's output 0 name different objects with the
+        // same number.
+        const WRITERS: u64 = 3;
+        const PER_WRITER: u64 = 4;
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let bridge = ledger.writer_bridge();
+                scope.spawn(move || {
+                    for local in 0..PER_WRITER {
+                        bridge.on_event(RollingWriterEvent::OutputOpened {
+                            logical_ordinal: local,
+                            path: format!("s3://b/w{writer}/o{local}.parquet"),
+                        });
+                    }
+                });
+            }
+        });
+
+        let events = observer.events();
+        let opened: Vec<u64> = events.iter().filter_map(opened_ordinal).collect();
+        assert_eq!(
+            opened.len() as u64,
+            WRITERS * PER_WRITER,
+            "every open is reported exactly once"
+        );
+        let unique: BTreeSet<u64> = opened.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            opened.len(),
+            "an ordinal is never reused across concurrent writers"
+        );
+        assert_eq!(
+            unique,
+            (0..WRITERS * PER_WRITER).collect::<BTreeSet<u64>>(),
+            "ordinals are attempt-global and dense, not reset per writer"
+        );
+        for event in &events {
+            assert_eq!(event.attempt_id(), attempt);
+        }
+
+        // The ordinal is reserved at open: it is already in the ledger, and
+        // already unsettled, before any close decision exists for it.
+        let outputs = ledger.outputs();
+        assert_eq!(outputs.len(), opened.len());
+        assert!(
+            outputs.iter().all(|output| !output.settled),
+            "an output whose close has not completed is never settled"
+        );
+        let ledger_ordinals: Vec<u64> = outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        let mut sorted = ledger_ordinals.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            ledger_ordinals, sorted,
+            "outputs are reported in open order"
+        );
+
+        // Closing settles the identity assigned at open — it does not mint a
+        // second one. Completion ordinals are a separate, attempt-global
+        // sequence in the order closes actually settled.
+        let single = AttemptLedger::new(attempt, Arc::clone(&observer) as Arc<dyn RewriteObserver>);
+        let bridge = single.writer_bridge();
+        bridge.on_event(RollingWriterEvent::OutputOpened {
+            logical_ordinal: 0,
+            path: "s3://b/solo/a.parquet".to_owned(),
+        });
+        bridge.on_event(RollingWriterEvent::OutputOpened {
+            logical_ordinal: 1,
+            path: "s3://b/solo/b.parquet".to_owned(),
+        });
+        bridge.on_event(RollingWriterEvent::CloseSettled {
+            logical_ordinal: 1,
+            completion_ordinal: 0,
+            path: "s3://b/solo/b.parquet".to_owned(),
+            reason: RollingCloseReason::Final,
+            output_files: Some(1),
+        });
+        bridge.on_event(RollingWriterEvent::CloseSettled {
+            logical_ordinal: 0,
+            completion_ordinal: 1,
+            path: "s3://b/solo/a.parquet".to_owned(),
+            reason: RollingCloseReason::Error,
+            output_files: None,
+        });
+
+        let settled = single.outputs();
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled[0].logical_ordinal, 0);
+        assert!(
+            !settled[0].settled,
+            "a close that produced no data file leaves a possibly-present object"
+        );
+        assert_eq!(settled[1].logical_ordinal, 1);
+        assert!(settled[1].settled);
+
+        let closes: Vec<(u64, u64)> = observer
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                RewriteEvent::OutputClosed {
+                    logical_ordinal,
+                    completion_ordinal,
+                    ..
+                } => Some((logical_ordinal, completion_ordinal)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closes,
+            vec![(1, 0), (0, 1)],
+            "a close reports the ordinal reserved at open, plus its own settle order"
+        );
+    }
+}

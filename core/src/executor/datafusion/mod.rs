@@ -54,8 +54,8 @@ pub mod iceberg_partition_expr;
 /// Without a managed context every rewrite shares one executor-wide runtime and
 /// spawns writer tasks that report nothing. With a context installed the
 /// executor is bound to exactly one publication attempt — sharing that
-/// attempt's leased runtime, honoring its cancellation token, and reporting
-/// every physical object it produced.
+/// attempt's leased runtime, refusing before any IO once that attempt's
+/// admission is withdrawn, and reporting every physical object it produced.
 #[derive(Default)]
 pub struct DataFusionExecutor {
     /// Caller-owned publication attempt this executor is bound to, if managed.
@@ -185,6 +185,25 @@ impl DataFusionExecutor {
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
     async fn rewrite_files(&self, request: RewriteFilesRequest) -> Result<RewriteFilesResponse> {
+        // Refuse before any IO. A caller that has already withdrawn its
+        // admission gets nothing read, nothing planned, and nothing opened, so
+        // there are no possible outputs to reconcile and no resource usage to
+        // account for. Discovering the withdrawal after the scan would leave
+        // the caller holding evidence about work it never authorised.
+        if let Some(context) = self.context.as_ref()
+            && context.is_cancelled()
+        {
+            let attempt_id = context.attempt_id();
+            context.observer().on_event(RewriteEvent::Cancelled {
+                attempt_id,
+                outputs: Vec::new(),
+            });
+            return Err(CompactionError::Cancelled {
+                attempt_id: attempt_id.to_string(),
+                outputs: Vec::new(),
+            });
+        }
+
         let RewriteFilesRequest {
             file_io,
             schema,

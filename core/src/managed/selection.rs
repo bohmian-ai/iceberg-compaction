@@ -110,6 +110,22 @@ impl SelectionReason {
         }
     }
 
+    /// Returns whether this reason may be recorded by `strategy`.
+    ///
+    /// A reason names the judgment that selected a file, so a reason from a
+    /// policy that did not run is a contradiction: the report would claim a
+    /// decision nobody took.
+    #[must_use]
+    pub fn belongs_to(&self, strategy: SelectionStrategyKind) -> bool {
+        match strategy.uniform_reason() {
+            Some(uniform) => *self == uniform,
+            None => !matches!(
+                self,
+                Self::UpstreamSmallFiles | Self::UpstreamFull | Self::UpstreamFilesWithDeletes
+            ),
+        }
+    }
+
     /// Returns whether this reason makes the file individually actionable.
     ///
     /// An individually actionable file is rewritten on its own: pairing an
@@ -217,16 +233,30 @@ impl SelectionReport {
     ///
     /// # Errors
     ///
-    /// Returns [`CompactionError::Config`] when a file path appears more than
-    /// once. A duplicate identity means two reasons were recorded for one file,
-    /// which makes the persisted reason ambiguous and must fail before the plan
-    /// is hashed.
+    /// Returns [`CompactionError::Config`] when the report is bound to no real
+    /// snapshot, when the strategy and the presence of a declared policy
+    /// identity contradict, when a file path appears more than once, or when a
+    /// recorded reason belongs to a policy that did not run. Each of these
+    /// makes the persisted decision unverifiable, so it must fail before the
+    /// plan is hashed rather than after an attempt has acted on it.
     pub fn new(
         strategy: SelectionStrategyKind,
         base_snapshot_id: i64,
         policy: Option<PolicyIdentity>,
         mut selected: Vec<SelectedFile>,
     ) -> Result<Self> {
+        if base_snapshot_id <= 0 {
+            return Err(CompactionError::Config(format!(
+                "selection report is bound to no snapshot (base_snapshot_id {base_snapshot_id})"
+            )));
+        }
+        let declares_policy = matches!(strategy, SelectionStrategyKind::WyrdIdentityAware);
+        if declares_policy != policy.is_some() {
+            return Err(CompactionError::Config(format!(
+                "selection strategy '{strategy}' and its declared policy identity contradict"
+            )));
+        }
+
         selected.sort();
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for entry in &selected {
@@ -234,6 +264,12 @@ impl SelectionReport {
                 return Err(CompactionError::Config(format!(
                     "selection report contains duplicate file identity '{}'",
                     entry.file_path
+                )));
+            }
+            if !entry.reason.belongs_to(strategy) {
+                return Err(CompactionError::Config(format!(
+                    "selection reason '{}' does not belong to strategy '{strategy}'",
+                    entry.reason
                 )));
             }
         }
