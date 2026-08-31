@@ -1563,7 +1563,9 @@ mod tests {
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
-    use iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+    use iceberg::writer::base_writer::position_delete_file_writer::{
+        PositionDeleteFileWriterBuilder, PositionDeleteInput,
+    };
     use iceberg::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
     use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
@@ -2204,6 +2206,315 @@ mod tests {
             })
             .collect();
         assert_eq!(actual_ids, target_ids);
+    }
+
+    /// Writes one data file holding the given rows and returns it.
+    ///
+    /// Each call produces its own physical object, which is what lets a test
+    /// name a row by `(data file, position)` and observe whether a delete was
+    /// scoped to the file it references.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch cannot be built or the writer cannot be closed to
+    /// exactly one file, either of which means the fixture is malformed.
+    async fn write_rows_file(
+        table: &Table,
+        warehouse_location: &str,
+        file_name_suffix: &str,
+        ids: &[i32],
+        names: &[&str],
+    ) -> DataFile {
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&simple_table_schema()).unwrap());
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+        ])
+        .unwrap();
+
+        let mut writer =
+            build_simple_data_writer(table, warehouse_location.to_owned(), file_name_suffix).await;
+        writer.write(batch).await.unwrap();
+        let mut files = writer.close().await.unwrap();
+        assert_eq!(files.len(), 1, "one batch produces one data file");
+        files.remove(0)
+    }
+
+    /// Writes one position-delete file naming `(referenced data file, row position)` pairs.
+    ///
+    /// The inputs are sorted by path and position because the Iceberg
+    /// position-delete writer expects them in that order; sorting here keeps
+    /// callers free to state deletions in whatever order reads best.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the writer cannot be built, written, or closed to exactly
+    /// one delete file.
+    async fn write_position_delete_file(
+        table: &Table,
+        warehouse_location: &str,
+        file_name_suffix: &str,
+        deletes: &[(&str, i64)],
+    ) -> DataFile {
+        let position_delete_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        2147483546,
+                        "file_path",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(2147483545, "pos", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(WriterProperties::new(), position_delete_schema),
+            table.file_io().clone(),
+            DefaultLocationGenerator::with_data_location(warehouse_location.to_owned()),
+            DefaultFileNameGenerator::new(
+                "pos-delete".to_owned(),
+                Some(file_name_suffix.to_owned()),
+                iceberg::spec::DataFileFormat::Parquet,
+            ),
+        );
+
+        let mut sorted = deletes.to_vec();
+        sorted.sort_unstable();
+        let mut writer = PositionDeleteFileWriterBuilder::new(rolling)
+            .build(None)
+            .await
+            .unwrap();
+        writer
+            .write(
+                sorted
+                    .into_iter()
+                    .map(|(path, pos)| PositionDeleteInput::new(Arc::from(path), pos))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let mut files = writer.close().await.unwrap();
+        assert_eq!(files.len(), 1, "one write produces one delete file");
+        files.remove(0)
+    }
+
+    /// Reads every produced data file and returns the surviving `id` values, sorted.
+    ///
+    /// Reading the physical objects rather than querying the table is what
+    /// makes the delete assertions row-semantic: a delete that was applied to
+    /// the wrong rows, or not applied at all, changes this list.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an output object cannot be read back as the `(id, name)`
+    /// projection the fixture wrote.
+    async fn surviving_ids(table: &Table, data_files: &[DataFile]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for file in data_files {
+            let content = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(content)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.extend(column.iter().map(|value| value.unwrap()));
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Position deletes must remove exactly the rows they reference.
+    ///
+    /// Two data files carrying the same row positions make the scoping
+    /// observable end to end: deleting position 0 of the first file and
+    /// position 1 of the second must drop exactly those two rows and keep the
+    /// other four. Asserting the surviving `id` values read back from the
+    /// rewritten objects — rather than file counts or generated SQL — is what
+    /// catches a merge-on-read plan that resolves the delete join against the
+    /// wrong rows.
+    #[tokio::test]
+    async fn test_position_deletes_remove_exactly_the_referenced_rows() {
+        let env = create_test_env().await;
+
+        let first = write_rows_file(
+            &env.table,
+            &env.warehouse_location,
+            "pos_delete_first",
+            &[10, 11, 12],
+            &["a0", "a1", "a2"],
+        )
+        .await;
+        let second = write_rows_file(
+            &env.table,
+            &env.warehouse_location,
+            "pos_delete_second",
+            &[20, 21, 22],
+            &["b0", "b1", "b2"],
+        )
+        .await;
+        let first_path = first.file_path().to_owned();
+        let second_path = second.file_path().to_owned();
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), vec![first, second]).await;
+
+        let deletes = write_position_delete_file(&table, &env.warehouse_location, "pos_delete", &[
+            (first_path.as_str(), 0),
+            (second_path.as_str(), 1),
+        ])
+        .await;
+        let transaction = Transaction::new(&table);
+        let table = transaction
+            .overwrite_files()
+            .add_data_files(vec![deletes])
+            .apply(transaction)
+            .unwrap()
+            .commit(env.catalog.as_ref())
+            .await
+            .unwrap();
+        drop(table);
+
+        let result = create_default_compaction(env.catalog.clone(), env.table_ident.clone())
+            .compact()
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            surviving_ids(&env.table, &result.data_files).await,
+            vec![11, 12, 20, 22],
+            "each position delete removed its own row in its own data file"
+        );
+    }
+
+    /// Writes one equality-delete file matching rows by the `id` column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the writer cannot be built, written, or closed to exactly
+    /// one delete file.
+    async fn write_equality_delete_file(
+        table: &Table,
+        warehouse_location: &str,
+        file_name_suffix: &str,
+        ids: &[i32],
+    ) -> DataFile {
+        let table_schema = table.metadata().current_schema().clone();
+        let equality_ids = vec![1];
+        let delete_schema = Arc::new(
+            Schema::builder()
+                .with_fields(
+                    equality_ids
+                        .iter()
+                        .map(|id| table_schema.field_by_id(*id).unwrap().clone())
+                        .collect_vec(),
+                )
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&delete_schema).unwrap());
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(ids.to_vec()))])
+                .unwrap();
+
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(WriterProperties::new(), delete_schema),
+            table.file_io().clone(),
+            DefaultLocationGenerator::with_data_location(warehouse_location.to_owned()),
+            DefaultFileNameGenerator::new(
+                "eq-delete".to_owned(),
+                Some(file_name_suffix.to_owned()),
+                iceberg::spec::DataFileFormat::Parquet,
+            ),
+        );
+        let mut writer = EqualityDeleteFileWriterBuilder::new(
+            rolling,
+            EqualityDeleteWriterConfig::new(equality_ids, table_schema).unwrap(),
+        )
+        .build(None)
+        .await
+        .unwrap();
+        writer.write(batch).await.unwrap();
+        let mut files = writer.close().await.unwrap();
+        assert_eq!(files.len(), 1, "one batch produces one delete file");
+        files.remove(0)
+    }
+
+    /// Position and equality deletes compose without either widening its scope.
+    ///
+    /// The merge-on-read plan chains one anti-join per delete kind, so a
+    /// regression in either chain link is only visible on the surviving rows.
+    /// Here row 0 of the first data file and the `id = 21` row of the second are
+    /// deleted by different mechanisms, and every other row must survive.
+    #[tokio::test]
+    async fn test_position_and_equality_deletes_remove_exactly_their_targets() {
+        let env = create_test_env().await;
+
+        let first = write_rows_file(
+            &env.table,
+            &env.warehouse_location,
+            "both_deletes_first",
+            &[10, 11, 12],
+            &["a0", "a1", "a2"],
+        )
+        .await;
+        let second = write_rows_file(
+            &env.table,
+            &env.warehouse_location,
+            "both_deletes_second",
+            &[20, 21, 22],
+            &["b0", "b1", "b2"],
+        )
+        .await;
+        let first_path = first.file_path().to_owned();
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), vec![first, second]).await;
+
+        let position_delete =
+            write_position_delete_file(&table, &env.warehouse_location, "both_deletes", &[(
+                first_path.as_str(),
+                0,
+            )])
+            .await;
+        let equality_delete =
+            write_equality_delete_file(&table, &env.warehouse_location, "both_deletes", &[21])
+                .await;
+        let transaction = Transaction::new(&table);
+        let table = transaction
+            .overwrite_files()
+            .add_data_files(vec![position_delete, equality_delete])
+            .apply(transaction)
+            .unwrap()
+            .commit(env.catalog.as_ref())
+            .await
+            .unwrap();
+        drop(table);
+
+        let result = create_default_compaction(env.catalog.clone(), env.table_ident.clone())
+            .compact()
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            surviving_ids(&env.table, &result.data_files).await,
+            vec![11, 12, 20, 22],
+            "each delete removed only the row it names"
+        );
     }
 
     /// Test the `plan_compaction` functionality
