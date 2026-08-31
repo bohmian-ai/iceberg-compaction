@@ -21,6 +21,7 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tokio_util::sync::CancellationToken;
 
+use super::bridge::AttemptLedger;
 use super::observer::{AttemptId, RewriteObserver, noop_observer};
 use crate::error::{CompactionError, Result};
 
@@ -217,6 +218,7 @@ pub struct ManagedExecutionContext {
     spill: Option<SpillLease>,
     cancellation: CancellationToken,
     observer: Arc<dyn RewriteObserver>,
+    ledger: Arc<AttemptLedger>,
 }
 
 impl ManagedExecutionContext {
@@ -275,6 +277,21 @@ impl ManagedExecutionContext {
     #[must_use]
     pub fn observer(&self) -> &Arc<dyn RewriteObserver> {
         &self.observer
+    }
+
+    /// Returns the attempt's one output ledger.
+    ///
+    /// The ledger belongs to the attempt, not to a rewrite call: an attempt
+    /// that executes several plans must number every object it opens in one
+    /// strictly increasing space and must be able to report the cumulative set
+    /// at its terminal event. A per-call ledger would restart ordinals at zero
+    /// for every plan, so two objects from one attempt could carry ordinal `0`,
+    /// and a later plan's terminal event would name only that plan's objects —
+    /// silently discarding evidence about objects an earlier plan left in
+    /// storage.
+    #[must_use]
+    pub fn ledger(&self) -> &Arc<AttemptLedger> {
+        &self.ledger
     }
 }
 
@@ -364,14 +381,19 @@ impl ManagedExecutionContextBuilder {
             );
         }
 
+        let attempt_id = self.attempt_id.unwrap_or_default();
+        let observer = self.observer.unwrap_or_else(noop_observer);
+        let ledger = AttemptLedger::new(attempt_id, Arc::clone(&observer));
+
         Ok(Arc::new(ManagedExecutionContext {
-            attempt_id: self.attempt_id.unwrap_or_default(),
+            attempt_id,
             runtime_env: runtime.build_arc()?,
             peak_memory_bytes,
             pool_capacity_bytes: self.pool_capacity_bytes,
             spill: self.spill,
             cancellation: self.cancellation.unwrap_or_default(),
-            observer: self.observer.unwrap_or_else(noop_observer),
+            observer,
+            ledger,
         }))
     }
 }

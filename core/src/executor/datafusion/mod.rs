@@ -119,17 +119,21 @@ impl CompactionExecutor for DataFusionExecutor {
         // there are no possible outputs to reconcile and no resource usage to
         // account for. Discovering the withdrawal after the scan would leave
         // the caller holding evidence about work it never authorised.
+        // The reported outputs are the attempt's, not this call's: a second plan
+        // refused before IO must still surface the objects an earlier plan in
+        // the same attempt already opened, or the caller would reclaim nothing.
         if let Some(context) = self.context.as_ref()
             && context.is_cancelled()
         {
             let attempt_id = context.attempt_id();
+            let outputs = context.ledger().outputs();
             context.observer().on_event(RewriteEvent::Cancelled {
                 attempt_id,
-                outputs: Vec::new(),
+                outputs: outputs.clone(),
             });
             return Err(CompactionError::Cancelled {
                 attempt_id: attempt_id.to_string(),
-                outputs: Vec::new(),
+                outputs,
             });
         }
 
@@ -178,9 +182,13 @@ impl CompactionExecutor for DataFusionExecutor {
             .await?;
         let arc_input_schema = Arc::new(input_schema);
 
-        let ledger = self.context.as_ref().map(|context| {
-            AttemptLedger::new(context.attempt_id(), Arc::clone(context.observer()))
-        });
+        // The attempt owns the ledger, so every plan this attempt rewrites draws
+        // its logical ordinals from one strictly increasing space and adds to
+        // one cumulative possible-output set.
+        let ledger: Option<Arc<AttemptLedger>> = self
+            .context
+            .as_ref()
+            .map(|context| Arc::clone(context.ledger()));
         let cancellation = self
             .context
             .as_ref()
@@ -331,7 +339,7 @@ impl CompactionExecutor for DataFusionExecutor {
         ledger.emit(RewriteEvent::Succeeded {
             attempt_id,
             outputs,
-            output_bytes: stats.output_total_bytes,
+            output_bytes: ledger.add_output_bytes(stats.output_total_bytes),
         });
 
         Ok(RewriteFilesResponse {

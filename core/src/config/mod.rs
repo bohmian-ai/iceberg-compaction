@@ -328,7 +328,24 @@ pub struct WyrdIdentityAwareConfig {
 
     /// Whether output parallelism is chosen heuristically.
     pub enable_heuristic_output_parallelism: bool,
+
+    /// Maximum canonical plans one planning pass may produce.
+    ///
+    /// The budget is a caller declaration about how much work one attempt may
+    /// hold a resource lease for, and it is applied by the core *while* the
+    /// canonical plans and the durable report are formed. That placement is the
+    /// whole point: a caller that trimmed a returned plan list would hold a
+    /// report describing work no plan performs, and every fingerprint taken
+    /// from that report would then name a selection the attempt never executed.
+    pub max_selection_plans: usize,
 }
+
+/// Plans one pass may produce when the caller declares no budget of its own.
+///
+/// Chosen high enough that an ordinary table plans exactly as it did before the
+/// budget existed, so the term only binds for a caller that deliberately sets
+/// it lower.
+pub const DEFAULT_MAX_SELECTION_PLANS: usize = 1_024;
 
 impl WyrdIdentityAwareConfig {
     /// Creates a config from a policy, defaulting the shared planning knobs.
@@ -341,7 +358,20 @@ impl WyrdIdentityAwareConfig {
             max_input_parallelism: available_parallelism().get() * 4,
             max_output_parallelism: available_parallelism().get(),
             enable_heuristic_output_parallelism: true,
+            max_selection_plans: DEFAULT_MAX_SELECTION_PLANS,
         }
+    }
+
+    /// Declares the maximum number of canonical plans one pass may produce.
+    ///
+    /// # Panics
+    ///
+    /// Never. A zero budget is rejected at planning time rather than here, so
+    /// the refusal names the pass that could not be planned.
+    #[must_use]
+    pub fn with_max_selection_plans(mut self, max_selection_plans: usize) -> Self {
+        self.max_selection_plans = max_selection_plans;
+        self
     }
 }
 

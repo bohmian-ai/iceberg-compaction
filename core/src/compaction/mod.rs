@@ -1530,17 +1530,31 @@ impl CompactionPlanner {
     /// # Errors
     ///
     /// Returns an error when the snapshot is absent from the table metadata,
-    /// when manifest identity cannot be read, or when the scan fails.
+    /// when manifest identity cannot be read, when the scan fails, or when the
+    /// caller declared a plan budget of zero.
+    ///
+    /// The declared plan budget is applied here, on the selector's own ordered
+    /// groups, before the join and therefore before either the plans or the
+    /// report exist. Capping the *groups* rather than the returned plans is what
+    /// makes the budget a selection decision: the report is derived from the
+    /// surviving join, so a budget-capped pass reports exactly the files its
+    /// plans rewrite and nothing from the pre-cap set.
     async fn joined_identity_groups(
         table: &Table,
         snapshot_id: i64,
         selector: &IdentityAwareSelector,
         config: &crate::config::WyrdIdentityAwareConfig,
     ) -> Result<Vec<JoinedGroup>> {
+        if config.max_selection_plans == 0 {
+            return Err(CompactionError::Config(
+                "identity-aware planning requires a plan budget of at least one".to_owned(),
+            ));
+        }
         let index =
             ManifestIdentityIndex::load(table, snapshot_id, config.policy.event_time_field_id)
                 .await?;
-        let groups = selector.select(index.identities())?;
+        let mut groups = selector.select(index.identities())?;
+        groups.truncate(config.max_selection_plans);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         Ok(join_groups_to_tasks(groups, tasks))
     }
@@ -3538,6 +3552,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wyrd_selection_plan_budget_caps_plans_and_report_together() {
+        let env = create_test_env().await;
+        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "budget", 6).await;
+        let largest = files
+            .iter()
+            .map(|file| file.file_size_in_bytes())
+            .max()
+            .expect("six files were written");
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        // Sized so an undersized run flushes after two files: six candidates
+        // therefore produce three groups, which is more than the budget under
+        // test and is what makes the cap observable at all.
+        let threshold = largest + 1;
+        let target = largest * 2 + 1;
+        let policy = crate::managed::WyrdSelectionPolicy {
+            small_file_threshold_bytes: threshold,
+            target_file_size_bytes: target,
+            ..forge_policy(&table, "v2", target, threshold)
+        };
+
+        let unbudgeted = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(policy.clone()),
+        ));
+        let (all_plans, all_report) = unbudgeted
+            .plan_compaction_with_report(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert!(
+            all_plans.len() > 2,
+            "the fixture must plan more work than the budget admits, got {}",
+            all_plans.len()
+        );
+
+        let budgeted = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(policy.clone()).with_max_selection_plans(2),
+        ));
+        let (plans, report) = budgeted
+            .plan_compaction_with_report(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
+
+        assert_eq!(plans.len(), 2, "the core admits exactly the declared budget");
+
+        // The budget is a selection decision, not a post-hoc trim: the report
+        // names the files the surviving plans rewrite and nothing from the
+        // groups the budget refused. A caller that trimmed the returned plans
+        // instead would still hold this report's pre-cap file set.
+        let mut planned: Vec<String> = plans
+            .iter()
+            .flat_map(|plan| plan.file_group.data_files.iter())
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        planned.sort();
+        let reported: Vec<String> = report
+            .selected_paths()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(reported, planned);
+        assert!(
+            report.selected.len() < all_report.selected.len(),
+            "a budgeted pass reports strictly less work than an unbudgeted one"
+        );
+        assert_eq!(
+            report.selected.len(),
+            plans
+                .iter()
+                .map(|plan| plan.file_group.data_file_count)
+                .sum::<usize>(),
+            "report totals equal the budgeted plans' totals"
+        );
+
+        // The admitted plans are the selector's own leading groups, so raising
+        // the budget only ever adds work to the tail.
+        let all_paths: Vec<String> = all_report
+            .selected_paths()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for path in &reported {
+            assert!(
+                all_paths.contains(path),
+                "a budgeted selection is drawn from the unbudgeted one"
+            );
+        }
+
+        // A zero budget names no work at all, so it is refused at the pass that
+        // could not be planned rather than reported as an empty selection.
+        let refused = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
+            crate::config::WyrdIdentityAwareConfig::new(policy).with_max_selection_plans(0),
+        ))
+        .plan_compaction_with_report(&table, MAIN_BRANCH)
+        .await;
+        assert!(
+            matches!(refused, Err(CompactionError::Config(_))),
+            "a zero plan budget must be refused, got {refused:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn wyrd_selection_refuses_unknown_or_contradictory_snapshot_evidence() {
         let env = create_test_env().await;
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "evid", 4).await;
@@ -3939,7 +4054,7 @@ mod tests {
     }
 
     /// Observer that withdraws the caller's admission the first time an output
-    /// is opened.
+    /// is opened *after the test arms it*.
     ///
     /// Cancelling from inside the observer is the caller acting on its own
     /// token, not the observer steering the core: the token belongs to the
@@ -3947,19 +4062,33 @@ mod tests {
     /// observation itself. It is used here because it is the only way to
     /// cancel at a known point in the writer's life — after work has started
     /// and before it can finish — without a timing race.
+    ///
+    /// Arming is what lets one attempt complete a plan before the cancel
+    /// lands: an attempt that executes several plans must be observable at the
+    /// exact moment a *later* plan has opened an object while an earlier
+    /// plan's objects are already settled.
     #[derive(Debug)]
     struct CancelOnFirstOutput {
         events: std::sync::Mutex<Vec<crate::managed::RewriteEvent>>,
         token: tokio_util::sync::CancellationToken,
+        armed: std::sync::atomic::AtomicBool,
     }
 
     impl CancelOnFirstOutput {
-        /// Creates an observer bound to the attempt's cancellation token.
-        fn new(token: tokio_util::sync::CancellationToken) -> Self {
+        /// Creates a disarmed observer bound to the attempt's cancellation
+        /// token; it records events but cancels nothing until armed.
+        fn disarmed(token: tokio_util::sync::CancellationToken) -> Self {
             Self {
                 events: std::sync::Mutex::new(Vec::new()),
                 token,
+                armed: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// Arms the observer so the next opened output cancels the attempt.
+        fn arm(&self) {
+            self.armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Returns the events recorded so far, in emission order.
@@ -3971,6 +4100,7 @@ mod tests {
     impl crate::managed::RewriteObserver for CancelOnFirstOutput {
         fn on_event(&self, event: crate::managed::RewriteEvent) {
             let first_open = matches!(event, crate::managed::RewriteEvent::OutputOpened { .. })
+                && self.armed.load(std::sync::atomic::Ordering::SeqCst)
                 && !self.token.is_cancelled();
             self.events.lock().unwrap().push(event);
             if first_open {
@@ -3983,26 +4113,45 @@ mod tests {
     async fn wyrd_cancellation_drains_writers_and_reports_possible_outputs() {
         let env = create_test_env().await;
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "cancel", 6).await;
+        let largest = files
+            .iter()
+            .map(|file| file.file_size_in_bytes())
+            .max()
+            .expect("six files were written");
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
 
         let token = tokio_util::sync::CancellationToken::new();
-        let observer = Arc::new(CancelOnFirstOutput::new(token.clone()));
+        // Disarmed: the attempt must complete one plan before the cancel lands,
+        // so the reported possible outputs can be checked for the union of an
+        // earlier plan's objects and the cancelled plan's own.
+        let observer = Arc::new(CancelOnFirstOutput::disarmed(token.clone()));
         let context = crate::managed::ManagedExecutionContext::builder()
             .with_cancellation(token)
             .with_observer(observer.clone())
             .build()
             .unwrap();
 
+        // Sized so an undersized run flushes after two files: the attempt gets
+        // more than one plan, which is the only way a per-call ledger and an
+        // attempt-owned one can be told apart.
+        let threshold = largest + 1;
+        let target = largest * 2 + 1;
         let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                &table, "v2", 2_000_000, 1_000_000,
-            )),
+            crate::config::WyrdIdentityAwareConfig::new(crate::managed::WyrdSelectionPolicy {
+                small_file_threshold_bytes: threshold,
+                target_file_size_bytes: target,
+                ..forge_policy(&table, "v2", target, threshold)
+            }),
         ));
         let plans = planner
             .plan_compaction_with_branch(&table, MAIN_BRANCH)
             .await
             .unwrap();
-        assert!(!plans.is_empty());
+        assert!(
+            plans.len() >= 2,
+            "one attempt must hold at least two plans, got {}",
+            plans.len()
+        );
 
         // A tiny target rolls a new output almost every batch, so the attempt
         // is guaranteed to have opened an object before the cancel lands.
@@ -4013,10 +4162,35 @@ mod tests {
                 .unwrap(),
         );
         let executor = DataFusionExecutor::with_context(Arc::clone(&context));
-        let cancelled = executor
+
+        // First plan runs to completion under the same attempt. Its objects are
+        // real files in storage, so the attempt still owes the caller their
+        // identities if a later plan is withdrawn.
+        executor
             .rewrite_files(rewrite_request_for(
                 &table,
                 &plans[0],
+                Arc::clone(&execution_config),
+                format!("{}/data/forge/v8", env.warehouse_location),
+            ))
+            .await
+            .expect("the first plan of the attempt completes");
+        let settled_before: std::collections::BTreeSet<u64> = context
+            .ledger()
+            .outputs()
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        assert!(
+            !settled_before.is_empty(),
+            "the completed plan left objects the attempt owns"
+        );
+
+        observer.arm();
+        let cancelled = executor
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[1],
                 execution_config,
                 format!("{}/data/forge/v8", env.warehouse_location),
             ))
@@ -4033,6 +4207,29 @@ mod tests {
         assert!(
             !outputs.is_empty(),
             "an attempt cancelled after it opened an object must report it"
+        );
+
+        // The reported set is the attempt's, not the cancelled call's: the
+        // earlier plan's objects are still named, and the ordinals never
+        // restarted at zero for the second plan.
+        let reported_all: std::collections::BTreeSet<u64> = outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        assert!(
+            settled_before.is_subset(&reported_all),
+            "a completed plan's objects survive into the cancelled attempt's report"
+        );
+        assert!(
+            reported_all.len() > settled_before.len(),
+            "the cancelled plan's own objects are reported alongside them"
+        );
+        let highest_before = *settled_before.last().expect("checked non-empty above");
+        assert!(
+            reported_all
+                .iter()
+                .any(|ordinal| *ordinal > highest_before),
+            "a later plan draws fresh ordinals rather than reusing the first plan's"
         );
 
         let events = observer.events();
@@ -4054,7 +4251,10 @@ mod tests {
             .map(|output| output.logical_ordinal)
             .collect();
         assert!(!opened.is_empty());
-        assert_eq!(reported, opened, "every opened output is reported");
+        assert_eq!(
+            reported, opened,
+            "every output the attempt opened, across both plans, is reported"
+        );
         assert_eq!(
             reported.len(),
             outputs.len(),
@@ -4083,15 +4283,24 @@ mod tests {
             .into_iter()
             .filter(crate::managed::RewriteEvent::is_terminal)
             .collect();
-        assert_eq!(terminals.len(), 1, "one terminal event per attempt");
+        assert_eq!(
+            terminals.len(),
+            2,
+            "one terminal event per plan: the completed one and the cancelled one"
+        );
+        assert!(
+            matches!(terminals[0], crate::managed::RewriteEvent::Succeeded { .. }),
+            "the first plan reported success, got {:?}",
+            terminals[0]
+        );
         let crate::managed::RewriteEvent::Cancelled {
             outputs: terminal_outputs,
             ..
-        } = &terminals[0]
+        } = &terminals[1]
         else {
             panic!(
                 "expected a cancellation terminal event, got {:?}",
-                terminals[0]
+                terminals[1]
             );
         };
         assert_eq!(terminal_outputs, &outputs);
@@ -4159,7 +4368,7 @@ mod tests {
             .with_observer(success_observer.clone())
             .build()
             .unwrap();
-        let executor = DataFusionExecutor::with_context(success_context);
+        let executor = DataFusionExecutor::with_context(Arc::clone(&success_context));
         let response = executor
             .rewrite_files(rewrite_request_for(
                 &table,
@@ -4213,8 +4422,13 @@ mod tests {
             .iter()
             .filter(|event| event.is_terminal())
             .collect();
-        assert_eq!(terminals.len(), 1, "exactly one terminal per attempt");
-        let crate::managed::RewriteEvent::Succeeded { outputs, .. } = terminals[0] else {
+        assert_eq!(terminals.len(), 1, "exactly one terminal per rewrite call");
+        let crate::managed::RewriteEvent::Succeeded {
+            outputs,
+            output_bytes: first_bytes,
+            ..
+        } = terminals[0]
+        else {
             panic!("expected a success terminal, got {:?}", terminals[0]);
         };
         assert_eq!(
@@ -4235,6 +4449,80 @@ mod tests {
         for event in &success_events {
             assert!(!event_name(event).is_empty());
         }
+
+        // A terminal event ends a plan, not the attempt. Rewriting again under
+        // the same context must neither reset the attempt's accumulated
+        // evidence nor change what the executor decides to do: the second
+        // terminal names the first plan's objects as well as its own, and the
+        // rewrite itself produces exactly what it produced before.
+        let first_outputs = outputs.clone();
+        let first_bytes = *first_bytes;
+        let repeated = executor
+            .rewrite_files(rewrite_request_for(
+                &table,
+                &plans[0],
+                execution_config.clone(),
+                format!("{}/data/forge/v9", env.warehouse_location),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.data_files.len(),
+            response.data_files.len(),
+            "a repeated terminal does not change the executor's decisions"
+        );
+        assert_eq!(
+            repeated.stats.input_files_count,
+            response.stats.input_files_count
+        );
+
+        let repeated_events = success_observer.events();
+        let repeated_terminals: Vec<&crate::managed::RewriteEvent> = repeated_events
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect();
+        assert_eq!(
+            repeated_terminals.len(),
+            2,
+            "one terminal per rewrite, two rewrites"
+        );
+        let crate::managed::RewriteEvent::Succeeded {
+            outputs: second_outputs,
+            output_bytes: second_bytes,
+            ..
+        } = repeated_terminals[1]
+        else {
+            panic!(
+                "expected a second success terminal, got {:?}",
+                repeated_terminals[1]
+            );
+        };
+        for output in &first_outputs {
+            assert!(
+                second_outputs.contains(output),
+                "the second terminal still names the first plan's objects"
+            );
+        }
+        assert!(
+            second_outputs.len() > first_outputs.len(),
+            "the second terminal adds its own objects to the attempt's set"
+        );
+        let second_ordinals: Vec<u64> = second_outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect();
+        assert!(
+            second_ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+            "the attempt numbers every object in one strictly increasing space"
+        );
+        assert!(
+            second_outputs.iter().all(|output| output.settled),
+            "two completed plans settle every object between them"
+        );
+        assert!(
+            *second_bytes > first_bytes,
+            "reported bytes accumulate across the attempt rather than restarting"
+        );
 
         // Non-semantic: attaching the observation seam changes nothing the
         // caller can act on. The same plan, executed unobserved, produces the

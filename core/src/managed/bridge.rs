@@ -11,6 +11,14 @@
 //! output is recorded immediately and marked settled only when its close
 //! completes, so a cancelled or failed attempt can still report the objects it
 //! may have left behind.
+//!
+//! The ledger's lifetime is the *attempt*, not the rewrite call. An attempt
+//! that executes several plans opens objects under several calls, and all of
+//! them are one caller's reconciliation problem: the ordinal space must not
+//! restart between plans, and a terminal event reached on a later plan must
+//! still name the objects an earlier plan left behind. The ledger therefore
+//! lives on [`ManagedExecutionContext`](super::context::ManagedExecutionContext)
+//! and is shared by every rewrite that attempt runs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +39,7 @@ pub struct AttemptLedger {
     next_ordinal: AtomicU64,
     next_completion_ordinal: AtomicU64,
     outputs: Mutex<HashMap<u64, OutputIdentity>>,
+    output_bytes: AtomicU64,
 }
 
 impl AttemptLedger {
@@ -43,7 +52,25 @@ impl AttemptLedger {
             next_ordinal: AtomicU64::new(0),
             next_completion_ordinal: AtomicU64::new(0),
             outputs: Mutex::new(HashMap::new()),
+            output_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// Folds one rewrite call's produced bytes into the attempt's total.
+    ///
+    /// Returns the cumulative total so a terminal event reports the attempt's
+    /// output volume rather than the last plan's, which is what keeps the byte
+    /// figure consistent with the cumulative output set beside it.
+    pub fn add_output_bytes(&self, bytes: u64) -> u64 {
+        self.output_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes)
+    }
+
+    /// Returns the bytes the attempt has produced so far.
+    #[must_use]
+    pub fn output_bytes(&self) -> u64 {
+        self.output_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns the attempt this ledger belongs to.
@@ -364,6 +391,40 @@ mod tests {
             closes,
             vec![(1, 0), (0, 1)],
             "a close reports the ordinal reserved at open, plus its own settle order"
+        );
+
+        // One attempt, two rewrites. A terminal event does not end the ledger:
+        // the second rewrite draws fresh ordinals above the first's and the
+        // cumulative set still names the first rewrite's objects, so a caller
+        // reclaiming after a late failure sees every object the attempt left.
+        single.emit(RewriteEvent::Succeeded {
+            attempt_id: attempt,
+            outputs: single.outputs(),
+            output_bytes: single.add_output_bytes(64),
+        });
+        let second_plan = single.writer_bridge();
+        second_plan.on_event(RollingWriterEvent::OutputOpened {
+            logical_ordinal: 0,
+            path: "s3://b/solo/c.parquet".to_owned(),
+        });
+
+        let across_plans = single.outputs();
+        assert_eq!(
+            across_plans
+                .iter()
+                .map(|output| output.logical_ordinal)
+                .collect::<Vec<u64>>(),
+            vec![0, 1, 2],
+            "a second rewrite continues the attempt's ordinals instead of restarting at zero"
+        );
+        assert_eq!(
+            across_plans[2].path, "s3://b/solo/c.parquet",
+            "the new ordinal names the object the second rewrite opened"
+        );
+        assert_eq!(
+            single.add_output_bytes(0),
+            64,
+            "produced bytes accumulate across the attempt's rewrites"
         );
     }
 }
