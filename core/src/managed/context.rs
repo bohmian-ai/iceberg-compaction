@@ -305,6 +305,7 @@ pub struct ManagedExecutionContextBuilder {
     memory_pool: Option<Arc<dyn MemoryPool>>,
     pool_capacity_bytes: Option<usize>,
     spill: Option<SpillLease>,
+    scratch_capacity_bytes: Option<u64>,
     cancellation: Option<CancellationToken>,
     observer: Option<Arc<dyn RewriteObserver>>,
 }
@@ -339,6 +340,22 @@ impl ManagedExecutionContextBuilder {
         self
     }
 
+    /// Bounds the leased scratch root at exactly `bytes`.
+    ///
+    /// Without this the runtime keeps `DataFusion`'s own default temp-directory
+    /// limit, which has nothing to do with what the caller actually admitted.
+    /// Supplying the admitted figure here is what makes the lease enforceable
+    /// rather than advisory: the runtime refuses the write that would exceed it
+    /// instead of letting an attempt overrun a budget the caller granted.
+    ///
+    /// The value is applied only alongside [`Self::with_spill_lease`]; see
+    /// [`Self::build`] for the refusal when no lease is present.
+    #[must_use]
+    pub fn with_scratch_capacity_bytes(mut self, bytes: u64) -> Self {
+        self.scratch_capacity_bytes = Some(bytes);
+        self
+    }
+
     /// Binds the caller's cancellation token.
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -362,7 +379,9 @@ impl ManagedExecutionContextBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`CompactionError::DataFusion`] when the runtime cannot be built.
+    /// Returns [`CompactionError::Config`] when a scratch capacity was supplied
+    /// without a spill lease, since there would be no directory to bound, and
+    /// [`CompactionError::DataFusion`] when the runtime cannot be built.
     pub fn build(self) -> Result<Arc<ManagedExecutionContext>> {
         let inner_pool = self
             .memory_pool
@@ -371,14 +390,27 @@ impl ManagedExecutionContextBuilder {
         let peak_memory_bytes = tracking.peak_handle();
 
         let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(tracking));
-        if let Some(spill) = self.spill.as_ref() {
-            runtime = runtime.with_disk_manager_builder(
-                datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(
-                    datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
-                        spill.root().to_path_buf(),
-                    ]),
-                ),
-            );
+        match (self.spill.as_ref(), self.scratch_capacity_bytes) {
+            (Some(spill), capacity) => {
+                let mut disk = datafusion::execution::disk_manager::DiskManagerBuilder::default()
+                    .with_mode(
+                        datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
+                            spill.root().to_path_buf(),
+                        ]),
+                    );
+                // Applied only when the caller named a figure, so a caller with
+                // no scratch policy keeps DataFusion's own default limit.
+                if let Some(bytes) = capacity {
+                    disk = disk.with_max_temp_directory_size(bytes);
+                }
+                runtime = runtime.with_disk_manager_builder(disk);
+            }
+            (None, Some(_)) => {
+                return Err(CompactionError::Config(
+                    "scratch capacity requires a spill lease".to_owned(),
+                ));
+            }
+            (None, None) => {}
         }
 
         let attempt_id = self.attempt_id.unwrap_or_default();
@@ -395,5 +427,84 @@ impl ManagedExecutionContextBuilder {
             observer,
             ledger,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// The leased scratch root is bounded at exactly the admitted byte figure.
+    ///
+    /// A lease the runtime does not enforce is a comment: the attempt would
+    /// spill past whatever the caller admitted and the caller would find out
+    /// from the filesystem. This asserts both halves — that the runtime carries
+    /// the exact figure, and that a tracked spill file crossing it is refused
+    /// by `DataFusion` itself rather than by anything this crate adds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the context cannot be built, when the runtime carries a
+    /// different limit, or when an over-limit spill is accepted.
+    #[test]
+    fn managed_context_enforces_exact_scratch_limit() {
+        const LIMIT: u64 = 4096;
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let context = ManagedExecutionContext::builder()
+            .with_spill_lease(SpillLease::new(root.path()).expect("the scratch root exists"))
+            .with_scratch_capacity_bytes(LIMIT)
+            .build()
+            .expect("a leased context builds");
+        let runtime = context.runtime_env();
+        assert_eq!(
+            runtime.disk_manager.max_temp_directory_size(),
+            LIMIT,
+            "the runtime enforces exactly the admitted scratch lease"
+        );
+
+        let spill = runtime
+            .disk_manager
+            .create_tmp_file("managed scratch lease")
+            .expect("a spill file inside the lease is created");
+        let mut writer = spill.open_writer().expect("the spill file is writable");
+        let chunk = vec![0_u8; usize::try_from(LIMIT).expect("the limit fits a usize")];
+        writer
+            .write_all(&chunk)
+            .expect("a spill up to the lease is accepted");
+        let refusal = writer
+            .write_all(&chunk)
+            .expect_err("a spill crossing the lease is refused");
+        assert!(
+            refusal.to_string().contains("exceeded the allowable limit"),
+            "the refusal is DataFusion's own temp-directory limit: {refusal}"
+        );
+        assert_eq!(
+            runtime.disk_manager.used_disk_space(),
+            LIMIT,
+            "the refused write left the lease exactly full, not overdrawn"
+        );
+    }
+
+    /// A scratch capacity without a scratch root is a configuration error.
+    ///
+    /// There is no directory to bound, so silently ignoring the figure would
+    /// leave a caller believing a limit is in force when nothing enforces it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the build succeeds or returns another error.
+    #[test]
+    fn managed_context_refuses_scratch_capacity_without_a_lease() {
+        let error = ManagedExecutionContext::builder()
+            .with_scratch_capacity_bytes(4096)
+            .build()
+            .expect_err("a capacity with no lease cannot be honored");
+        assert!(
+            matches!(error, CompactionError::Config(_)),
+            "the refusal is a configuration error: {error}"
+        );
     }
 }
