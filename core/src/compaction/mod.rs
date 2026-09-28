@@ -3932,7 +3932,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(plans.len(), 2, "the core admits exactly the declared budget");
+        assert_eq!(
+            plans.len(),
+            2,
+            "the core admits exactly the declared budget"
+        );
 
         // The budget is a selection decision, not a post-hoc trim: the report
         // names the files the surviving plans rewrite and nothing from the
@@ -4425,8 +4429,7 @@ mod tests {
 
         /// Arms the observer so the next opened output cancels the attempt.
         fn arm(&self) {
-            self.armed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Returns the events recorded so far, in emission order.
@@ -4564,9 +4567,7 @@ mod tests {
         );
         let highest_before = *settled_before.last().expect("checked non-empty above");
         assert!(
-            reported_all
-                .iter()
-                .any(|ordinal| *ordinal > highest_before),
+            reported_all.iter().any(|ordinal| *ordinal > highest_before),
             "a later plan draws fresh ordinals rather than reusing the first plan's"
         );
 

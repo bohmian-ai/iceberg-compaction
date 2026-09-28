@@ -172,22 +172,22 @@ mod tests {
     const PINS: &[NativePin] = &[
         NativePin {
             name: "arrow",
-            version: "59.2.0",
+            version: "59.3.0",
             source_contains: "registry+https://github.com/rust-lang/crates.io-index",
         },
         NativePin {
             name: "arrow-array",
-            version: "59.2.0",
+            version: "59.3.0",
             source_contains: "registry+https://github.com/rust-lang/crates.io-index",
         },
         NativePin {
             name: "arrow-schema",
-            version: "59.2.0",
+            version: "59.3.0",
             source_contains: "registry+https://github.com/rust-lang/crates.io-index",
         },
         NativePin {
             name: "parquet",
-            version: "59.2.0",
+            version: "59.3.0",
             source_contains: "registry+https://github.com/rust-lang/crates.io-index",
         },
         NativePin {
@@ -203,7 +203,7 @@ mod tests {
         NativePin {
             name: "iceberg",
             version: "0.10.0",
-            source_contains: "git+https://github.com/bohmian-ai/iceberg-rust.git?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe",
+            source_contains: "git+https://github.com/bohmian-ai/iceberg-rust.git?rev=3712abbfb348bca9fc714d226685a477afe9bd65",
         },
     ];
 
@@ -233,7 +233,7 @@ mod tests {
         // Negative fixture: one native version drifts. The check must fail,
         // otherwise the green above proves nothing.
         let drifted = LOCKFILE.replacen(
-            "name = \"arrow\"\nversion = \"59.2.0\"",
+            "name = \"arrow\"\nversion = \"59.3.0\"",
             "name = \"arrow\"\nversion = \"58.0.0\"",
             1,
         );
@@ -258,7 +258,7 @@ mod tests {
 
         // Negative fixture: right version, foreign source.
         let reforked = LOCKFILE.replace(
-            "git+https://github.com/bohmian-ai/iceberg-rust.git?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe",
+            "git+https://github.com/bohmian-ai/iceberg-rust.git?rev=3712abbfb348bca9fc714d226685a477afe9bd65",
             "registry+https://github.com/rust-lang/crates.io-index",
         );
         let error = NativeUniverseAudit::from_lockfile(&reforked)
