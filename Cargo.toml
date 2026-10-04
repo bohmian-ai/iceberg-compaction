@@ -19,13 +19,13 @@ datafusion = "55.0.0"
 # Local workspace members
 futures = "0.3.17"
 # Managed Wyrd fork: minimal patch set over RisingWave dev_rebase_main_20260807 5d8df5e5f0508b31f2ada532dc861e97820f96af.
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
-iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
-iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
-iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed" }
+iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed" }
+iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed" }
+iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "330fe331b5a312ed60d9ff6760100137a83a934f", features = [
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed" }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "0f47bc302abf31d7dca92f479a91c1b212cf44ed", features = [
     "opendal-s3",
 ] }
 
