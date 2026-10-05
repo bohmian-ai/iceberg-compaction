@@ -104,9 +104,8 @@ impl NonCommittingCompaction {
     ///
     /// Propagates
     /// [`plan_compaction_with_report`](crate::compaction::Compaction::plan_compaction_with_report):
-    /// a missing configuration, an absent branch snapshot, unreadable manifest
-    /// identity, an inconsistent policy, or a report that would not be
-    /// canonical.
+    /// a missing configuration, an absent branch snapshot, a planning failure,
+    /// or a report that would not be canonical.
     pub async fn plan_with_report(&self) -> Result<(Vec<CompactionPlan>, SelectionReport)> {
         self.inner.plan_compaction_with_report().await
     }
@@ -145,13 +144,8 @@ mod tests {
     use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 
     use super::NonCommittingCompaction;
-    use crate::config::{
-        CompactionConfigBuilder, CompactionPlanningConfig, WyrdIdentityAwareConfig,
-    };
+    use crate::config::{CompactionConfigBuilder, CompactionPlanningConfig, SmallFilesConfig};
     use crate::managed::context::ManagedExecutionContext;
-    use crate::managed::selection::{
-        OpenPartitionPolicy, WriterRecipeResolver, WyrdSelectionPolicy,
-    };
 
     /// Catalog that serves reads and turns every mutation into a failure.
     #[derive(Debug)]
@@ -344,27 +338,14 @@ mod tests {
         let read_only: Arc<dyn Catalog> = Arc::new(ReadOnlyCatalog {
             inner: catalog.clone() as Arc<dyn Catalog>,
         });
-        let table = catalog.load_table(&table_ident).await.unwrap();
-        let policy = WyrdSelectionPolicy {
-            schema_id: table.metadata().current_schema_id(),
-            partition_spec_id: table.metadata().default_partition_spec_id(),
-            sort_order_id: table.metadata().default_sort_order().order_id as i32,
-            writer_recipe: "v2".to_owned(),
-            recipe_resolver: WriterRecipeResolver::forge(),
-            target_file_size_bytes: 2_000_000,
-            small_file_threshold_bytes: 1_000_000,
-            open_partitions: OpenPartitionPolicy::AllClosed,
-            emit_open_partition_tail: false,
-            event_time_field_id: None,
-        };
         let context = ManagedExecutionContext::builder().build().unwrap();
         let boundary = NonCommittingCompaction::new(
             read_only,
             table_ident.clone(),
             Arc::new(
                 CompactionConfigBuilder::default()
-                    .planning(CompactionPlanningConfig::WyrdIdentityAware(
-                        WyrdIdentityAwareConfig::new(policy),
+                    .planning(CompactionPlanningConfig::SmallFiles(
+                        SmallFilesConfig::default(),
                     ))
                     .build()
                     .unwrap(),

@@ -156,30 +156,6 @@ impl DataFusionExecutor {
     pub fn context(&self) -> Option<&Arc<ManagedExecutionContext>> {
         self.context.as_ref()
     }
-
-    /// Reports the attempt's resource usage before its terminal event.
-    ///
-    /// Peak memory is always reported; scratch accounting only when the caller
-    /// leased a root. A scratch measurement that fails is skipped rather than
-    /// failing the attempt: losing an accounting figure must not destroy an
-    /// otherwise complete rewrite.
-    fn report_resource_usage(context: &ManagedExecutionContext) {
-        let attempt_id = context.attempt_id();
-        context.observer().on_event(RewriteEvent::PeakMemory {
-            attempt_id,
-            peak_bytes: context.peak_memory_bytes(),
-            pool_capacity_bytes: context.pool_capacity_bytes(),
-        });
-        if let Some(spill) = context.spill()
-            && spill.measure().is_ok()
-        {
-            context.observer().on_event(RewriteEvent::ScratchSpill {
-                attempt_id,
-                current_bytes: spill.current_bytes(),
-                peak_bytes: spill.peak_bytes(),
-            });
-        }
-    }
 }
 
 #[async_trait]
@@ -377,7 +353,6 @@ impl CompactionExecutor for DataFusionExecutor {
         };
 
         let ledger = ledger.expect("a managed context always installs a ledger");
-        Self::report_resource_usage(context);
         let outputs = ledger.outputs();
         let attempt_id = context.attempt_id();
 

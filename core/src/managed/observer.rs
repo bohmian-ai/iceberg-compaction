@@ -125,35 +125,6 @@ pub enum RewriteEvent {
         /// Number of data files the close produced, or `None` when it failed.
         output_files: Option<usize>,
     },
-    /// Peak memory reserved from the leased pool during the attempt.
-    PeakMemory {
-        /// Attempt the measurement belongs to.
-        attempt_id: AttemptId,
-        /// Highest simultaneous reservation observed.
-        peak_bytes: usize,
-        /// Capacity of the leased pool, when it is bounded.
-        pool_capacity_bytes: Option<usize>,
-    },
-    /// A query operator spilled to disk under memory pressure.
-    OperatorSpill {
-        /// Attempt the spill belongs to.
-        attempt_id: AttemptId,
-        /// Number of spill events the plan reported.
-        spill_count: usize,
-        /// Bytes the plan reported spilling.
-        spilled_bytes: u64,
-        /// Rows the plan reported spilling.
-        spilled_rows: u64,
-    },
-    /// Accounting for the caller-leased scratch root.
-    ScratchSpill {
-        /// Attempt the accounting belongs to.
-        attempt_id: AttemptId,
-        /// Bytes currently resident under the scratch root.
-        current_bytes: u64,
-        /// Highest byte usage observed under the scratch root.
-        peak_bytes: u64,
-    },
     /// The attempt produced its complete output set.
     Succeeded {
         /// Attempt that succeeded.
@@ -192,9 +163,6 @@ impl RewriteEvent {
             Self::OutputOpened { attempt_id, .. }
             | Self::RollDecided { attempt_id, .. }
             | Self::OutputClosed { attempt_id, .. }
-            | Self::PeakMemory { attempt_id, .. }
-            | Self::OperatorSpill { attempt_id, .. }
-            | Self::ScratchSpill { attempt_id, .. }
             | Self::Succeeded { attempt_id, .. }
             | Self::Failed { attempt_id, .. }
             | Self::Cancelled { attempt_id, .. } => *attempt_id,

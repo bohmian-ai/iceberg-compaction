@@ -29,20 +29,16 @@ use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
-use crate::compaction::identity_plan::{JoinedGroup, join_groups_to_tasks};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
     ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
 };
-use crate::file_selection::{FileGroup, FileSelector, ManifestIdentityIndex};
-use crate::managed::selection::{
-    IdentityAwareSelector, SelectedFile, SelectionGroup, SelectionReport, SelectionStrategyKind,
-};
+use crate::file_selection::{FileGroup, FileSelector};
+use crate::managed::selection::{SelectedFile, SelectionReport, SelectionStrategyKind};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
-mod identity_plan;
 mod validator;
 
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
@@ -1474,21 +1470,18 @@ impl CompactionPlanner {
     }
 
     /// Plans compaction and returns the plans together with a complete account
-    /// of why each file was selected.
+    /// of which files were selected.
     ///
     /// The report is the durable half of a plan: the caller persists it before
     /// any attempt exists, so an attempt can be checked against the decision
-    /// that authorised it. Plans and report come from one derivation, so every
-    /// path in the report appears in exactly one returned plan and every data
-    /// file in the returned plans appears in the report — a disagreement is not
-    /// merely detectable, it is unconstructible.
+    /// that authorised it. The report is derived from the returned plans, so
+    /// every path in the report appears in exactly one returned plan and every
+    /// data file in the returned plans appears in the report.
     ///
     /// # Errors
     ///
-    /// Returns an error when the branch snapshot is missing, when manifest
-    /// identity cannot be read, when the policy is inconsistent, when
-    /// parallelism calculation fails, or when the report would contain a
-    /// duplicate identity.
+    /// Returns an error when the branch snapshot is missing, when planning
+    /// fails, or when the report would contain a duplicate identity.
     pub async fn plan_compaction_with_report(
         &self,
         table: &Table,
@@ -1501,50 +1494,23 @@ impl CompactionPlanner {
         };
         let snapshot_id = branch_snapshot.snapshot_id();
 
-        let CompactionPlanningConfig::WyrdIdentityAware(config) = &self.config else {
-            let plans = self.plan_compaction_with_branch(table, to_branch).await?;
-            let strategy = Self::upstream_strategy_kind(&self.config);
-            let reason = strategy
-                .uniform_reason()
-                .expect("upstream strategies always declare a uniform reason");
-            let selected = plans
-                .iter()
-                .flat_map(|plan| plan.file_group.data_files.iter())
-                .map(|task| SelectedFile {
-                    file_path: task.data_file_path.clone(),
-                    reason,
-                })
-                .collect();
-            let report = SelectionReport::new(strategy, snapshot_id, None, selected)?;
-            return Ok((plans, report));
-        };
-
-        let selector = IdentityAwareSelector::new(config.policy.clone())?;
-        let (joined, min_sequence) =
-            Self::joined_identity_groups(table, snapshot_id, &selector, config).await?;
-
-        let mut plans = Vec::with_capacity(joined.len());
-        let mut groups: Vec<SelectionGroup> = Vec::with_capacity(joined.len());
-        for JoinedGroup { group, tasks } in joined {
-            let file_group = FileGroup::new(tasks).with_calculated_parallelism(&self.config)?;
-            plans.push(
-                CompactionPlan::new(file_group, to_branch.to_owned(), snapshot_id)
-                    .with_delete_cleanup_min_data_sequence_number(min_sequence),
-            );
-            groups.push(group);
-        }
-        let report = selector.report(snapshot_id, &groups)?;
-
+        let plans = self.plan_compaction_with_branch(table, to_branch).await?;
+        let strategy = Self::strategy_kind(&self.config);
+        let reason = strategy.uniform_reason();
+        let selected = plans
+            .iter()
+            .flat_map(|plan| plan.file_group.data_files.iter())
+            .map(|task| SelectedFile {
+                file_path: task.data_file_path.clone(),
+                reason,
+            })
+            .collect();
+        let report = SelectionReport::new(strategy, snapshot_id, selected)?;
         Ok((plans, report))
     }
 
-    /// Maps an upstream planning config to its report strategy.
-    ///
-    /// # Panics
-    ///
-    /// Never: the identity-aware variant is handled by its own branch before
-    /// this is reached, and the fallback preserves that invariant explicitly.
-    fn upstream_strategy_kind(config: &CompactionPlanningConfig) -> SelectionStrategyKind {
+    /// Maps a planning config to its report strategy.
+    fn strategy_kind(config: &CompactionPlanningConfig) -> SelectionStrategyKind {
         match config {
             CompactionPlanningConfig::SmallFiles(_) => SelectionStrategyKind::UpstreamSmallFiles,
             CompactionPlanningConfig::Full(_) => SelectionStrategyKind::UpstreamFull,
@@ -1552,17 +1518,10 @@ impl CompactionPlanner {
                 SelectionStrategyKind::UpstreamFilesWithDeletes
             }
             CompactionPlanningConfig::Auto(_) => SelectionStrategyKind::UpstreamAuto,
-            CompactionPlanningConfig::WyrdIdentityAware(_) => {
-                SelectionStrategyKind::WyrdIdentityAware
-            }
         }
     }
 
     /// Customization point for file grouping logic.
-    ///
-    /// Upstream configs run the filter/grouping pipeline. The identity-aware
-    /// config is routed to its own selector instead: its precedence is stateful
-    /// and its grouping is ordered, neither of which the pipeline can express.
     async fn group_files_for_compaction(
         &self,
         table: &Table,
@@ -1570,86 +1529,11 @@ impl CompactionPlanner {
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
-        if let CompactionPlanningConfig::WyrdIdentityAware(config) = &self.config {
-            return self
-                .group_files_by_identity(table, snapshot_id, config)
-                .await;
-        }
-
         let strategy = PlanStrategy::from(&self.config);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
         let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
         Ok((file_groups, min_sequence))
-    }
-
-    /// Groups files using the core-owned identity-aware policy.
-    ///
-    /// The scan is still the source of the tasks, so delete attachment,
-    /// projection, and deletion-vector handling stay exactly as upstream built
-    /// them. Only the *choice* of which tasks to keep, and how to group them,
-    /// comes from the policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the policy is inconsistent, when manifest identity
-    /// cannot be read, or when parallelism calculation fails for a group.
-    async fn group_files_by_identity(
-        &self,
-        table: &Table,
-        snapshot_id: i64,
-        config: &crate::config::WyrdIdentityAwareConfig,
-    ) -> Result<(Vec<FileGroup>, Option<i64>)> {
-        let selector = IdentityAwareSelector::new(config.policy.clone())?;
-        let (joined, min_sequence) =
-            Self::joined_identity_groups(table, snapshot_id, &selector, config).await?;
-        let file_groups = joined
-            .into_iter()
-            .map(|joined| FileGroup::new(joined.tasks).with_calculated_parallelism(&self.config))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((file_groups, min_sequence))
-    }
-
-    /// Runs the identity-aware policy against one snapshot and joins its groups
-    /// onto that snapshot's scan tasks.
-    ///
-    /// This is the single derivation behind both the plans and the durable
-    /// report. Running it twice would let the two disagree; running it once
-    /// makes the report a function of the plans by construction. The same scan
-    /// also yields upstream's delete-cleanup lower bound, which describes the
-    /// snapshot's live data rather than the files this policy selected.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the snapshot is absent from the table metadata,
-    /// when manifest identity cannot be read, when the scan fails, or when the
-    /// caller declared a plan budget of zero.
-    ///
-    /// The declared plan budget is applied here, on the selector's own ordered
-    /// groups, before the join and therefore before either the plans or the
-    /// report exist. Capping the *groups* rather than the returned plans is what
-    /// makes the budget a selection decision: the report is derived from the
-    /// surviving join, so a budget-capped pass reports exactly the files its
-    /// plans rewrite and nothing from the pre-cap set.
-    async fn joined_identity_groups(
-        table: &Table,
-        snapshot_id: i64,
-        selector: &IdentityAwareSelector,
-        config: &crate::config::WyrdIdentityAwareConfig,
-    ) -> Result<(Vec<JoinedGroup>, Option<i64>)> {
-        if config.max_selection_plans == 0 {
-            return Err(CompactionError::Config(
-                "identity-aware planning requires a plan budget of at least one".to_owned(),
-            ));
-        }
-        let index =
-            ManifestIdentityIndex::load(table, snapshot_id, config.policy.event_time_field_id)
-                .await?;
-        let mut groups = selector.select(index.identities())?;
-        groups.truncate(config.max_selection_plans);
-        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
-        let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
-        Ok((join_groups_to_tasks(groups, tasks), min_sequence))
     }
 }
 
@@ -1687,7 +1571,6 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use crate::compaction::identity_plan::join_groups_to_tasks;
     // Additional imports for new tests
     use crate::compaction::{
         CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
@@ -1701,8 +1584,6 @@ mod tests {
     use crate::executor::{
         CompactionExecutor, DataFusionExecutor, ExecutorType, RewriteFilesRequest, RewriteFilesStat,
     };
-    use crate::file_selection::{FileSelector, ManifestIdentityIndex};
-    use crate::managed::selection::IdentityAwareSelector;
 
     mod file_group_scope;
 
@@ -3535,7 +3416,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Managed execution and identity-aware selection
+    // Managed execution and selection reports
     // ------------------------------------------------------------------
 
     /// Catalog wrapper that serves reads and refuses every mutation.
@@ -3676,10 +3557,6 @@ mod tests {
     }
 
     /// Writes `count` small data files under a Forge-shaped data location.
-    ///
-    /// The path shape matters: the identity-aware policy recovers the writer
-    /// recipe from `/data/forge/<recipe>/`, so files written anywhere else
-    /// would classify as recipe drift and never exercise the size path.
     async fn write_forge_files(
         table: &Table,
         warehouse_location: &str,
@@ -3706,8 +3583,7 @@ mod tests {
                 location_generator,
                 file_name_generator,
             );
-            // Stamping the current sort order is what a real Wyrd writer does;
-            // without it every file would read as sort-order drift.
+            // Stamping the current sort order is what a real Wyrd writer does.
             let mut writer = DataFileWriterBuilder::new(rolling_writer_builder)
                 .sort_order_id(Some(table.metadata().default_sort_order().order_id as i32))
                 .build(None)
@@ -3722,25 +3598,19 @@ mod tests {
         all
     }
 
-    /// Builds a policy whose "current" identity is the table's own.
-    fn forge_policy(
-        table: &Table,
-        recipe: &str,
-        target: u64,
-        threshold: u64,
-    ) -> crate::managed::WyrdSelectionPolicy {
-        crate::managed::WyrdSelectionPolicy {
-            schema_id: table.metadata().current_schema_id(),
-            partition_spec_id: table.metadata().default_partition_spec_id(),
-            sort_order_id: table.metadata().default_sort_order().order_id as i32,
-            writer_recipe: recipe.to_owned(),
-            recipe_resolver: crate::managed::WriterRecipeResolver::forge(),
-            target_file_size_bytes: target,
-            small_file_threshold_bytes: threshold,
-            open_partitions: crate::managed::OpenPartitionPolicy::AllClosed,
-            emit_open_partition_tail: false,
-            event_time_field_id: None,
-        }
+    /// Selects every fixture file with upstream's small-files policy.
+    ///
+    /// The threshold sits far above any fixture file, so every file is small
+    /// and the unpartitioned fixture plans one group unless `grouping` splits it.
+    fn small_files_planning(grouping: crate::config::GroupingStrategy) -> CompactionPlanningConfig {
+        CompactionPlanningConfig::SmallFiles(
+            SmallFilesConfigBuilder::default()
+                .target_file_size_bytes(2_000_000_u64)
+                .small_file_threshold_bytes(1_000_000_u64)
+                .grouping_strategy(grouping)
+                .build()
+                .unwrap(),
+        )
     }
 
     /// Builds a rewrite request straight against the executor.
@@ -3767,6 +3637,10 @@ mod tests {
         }
     }
 
+    /// The report is derived from the final plans and bound to their snapshot.
+    ///
+    /// A report that named a file no plan rewrites, or missed one a plan does,
+    /// would let a caller persist a decision the attempt never executes.
     #[tokio::test]
     async fn wyrd_selection_report_is_canonical_and_matches_final_plans() {
         let env = create_test_env().await;
@@ -3774,12 +3648,7 @@ mod tests {
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
         let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        let planning = CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                &table, "v2", 2_000_000, 1_000_000,
-            )),
-        );
-        let planner = CompactionPlanner::new(planning.clone());
+        let planner = CompactionPlanner::new(small_files_planning(Default::default()));
         let (plans, report) = planner
             .plan_compaction_with_report(&table, MAIN_BRANCH)
             .await
@@ -3787,7 +3656,7 @@ mod tests {
 
         assert_eq!(
             report.strategy,
-            crate::managed::SelectionStrategyKind::WyrdIdentityAware
+            crate::managed::SelectionStrategyKind::UpstreamSmallFiles
         );
         assert_eq!(report.base_snapshot_id, snapshot_id);
         assert!(!plans.is_empty(), "four small files must produce a plan");
@@ -3799,8 +3668,6 @@ mod tests {
             assert_eq!(plan.to_branch, MAIN_BRANCH);
         }
 
-        // The report is exactly the set of files the plans will rewrite:
-        // nothing extra, nothing missing, no duplicates, sorted by identity.
         let mut planned: Vec<String> = plans
             .iter()
             .flat_map(|plan| plan.file_group.data_files.iter())
@@ -3812,307 +3679,31 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        assert_eq!(reported, planned);
-        assert_eq!(
-            report.selected.len(),
-            plans
+        assert_eq!(reported, planned, "the report is exactly the planned files");
+        assert!(
+            report
+                .selected
                 .iter()
-                .map(|plan| plan.file_group.data_file_count)
-                .sum::<usize>(),
-            "report totals equal the plans' totals"
+                .all(|entry| entry.reason == crate::managed::SelectionReason::UpstreamSmallFiles),
+            "every file carries the policy's own reason"
         );
 
-        let unique: std::collections::BTreeSet<&String> = planned.iter().collect();
-        assert_eq!(unique.len(), planned.len(), "no identity appears twice");
-
-        // Every file of one plan carries one reason, and that reason is the
-        // one the report recorded: a plan is one selection group, not a mix.
-        let reason_by_path: HashMap<&str, crate::managed::SelectionReason> = report
-            .selected
-            .iter()
-            .map(|entry| (entry.file_path.as_str(), entry.reason))
-            .collect();
-        for plan in &plans {
-            let mut reasons: std::collections::BTreeSet<crate::managed::SelectionReason> =
-                std::collections::BTreeSet::new();
-            for task in &plan.file_group.data_files {
-                reasons.insert(reason_by_path[task.data_file_path.as_str()]);
-            }
-            assert_eq!(reasons.len(), 1, "one plan carries exactly one reason");
-        }
-
-        // Small current-identity files are packed, not rewritten one by one.
-        for entry in &report.selected {
-            assert_eq!(entry.reason, crate::managed::SelectionReason::Undersized);
-        }
-
-        // The declared policy travels with the report.
-        let policy = report.policy.as_ref().unwrap();
-        assert_eq!(policy.writer_recipe, "v2");
-        assert_eq!(policy.target_file_size_bytes, 2_000_000);
-        assert_eq!(policy.max_file_size_bytes, 3_600_000);
-
-        // Canonical means derived from the final plans, not re-derived beside
-        // them: an identity the scan did not produce is rewritten by no plan,
-        // so the report must not name it either.
-        let CompactionPlanningConfig::WyrdIdentityAware(config) = &planning else {
-            unreachable!("planning was constructed as identity-aware");
-        };
-        let selector = IdentityAwareSelector::new(config.policy.clone()).unwrap();
-        let index = ManifestIdentityIndex::load(&table, snapshot_id, None)
+        // The plans are the upstream plans: the report adds evidence, never
+        // a different selection.
+        let upstream = planner
+            .plan_compaction_with_branch(&table, MAIN_BRANCH)
             .await
             .unwrap();
-        let groups = selector.select(index.identities()).unwrap();
-        let mut tasks = FileSelector::scan_data_files(&table, snapshot_id)
-            .await
-            .unwrap();
-        let dropped = tasks
-            .pop()
-            .expect("the snapshot has scan tasks")
-            .data_file_path;
+        assert_eq!(upstream.len(), plans.len());
 
-        let joined = join_groups_to_tasks(groups, tasks);
-        for entry in &joined {
-            assert_eq!(
-                entry.group.files.len(),
-                entry.tasks.len(),
-                "a joined group names exactly the files its plan will read"
-            );
-            assert!(
-                !entry
-                    .group
-                    .files
-                    .iter()
-                    .any(|file| file.file_path == dropped),
-                "an identity with no scan task cannot survive into the report"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wyrd_selection_plan_budget_caps_plans_and_report_together() {
-        let env = create_test_env().await;
-        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "budget", 6).await;
-        let largest = files
-            .iter()
-            .map(|file| file.file_size_in_bytes())
-            .max()
-            .expect("six files were written");
-        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
-
-        // Sized so an undersized run flushes after two files: six candidates
-        // therefore produce three groups, which is more than the budget under
-        // test and is what makes the cap observable at all.
-        let threshold = largest + 1;
-        let target = largest * 2 + 1;
-        let policy = crate::managed::WyrdSelectionPolicy {
-            small_file_threshold_bytes: threshold,
-            target_file_size_bytes: target,
-            ..forge_policy(&table, "v2", target, threshold)
-        };
-
-        let unbudgeted = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(policy.clone()),
-        ));
-        let (all_plans, all_report) = unbudgeted
-            .plan_compaction_with_report(&table, MAIN_BRANCH)
-            .await
-            .unwrap();
+        // A branch with no snapshot cannot authorise a plan.
         assert!(
-            all_plans.len() > 2,
-            "the fixture must plan more work than the budget admits, got {}",
-            all_plans.len()
-        );
-
-        let budgeted = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(policy.clone()).with_max_selection_plans(2),
-        ));
-        let (plans, report) = budgeted
-            .plan_compaction_with_report(&table, MAIN_BRANCH)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            plans.len(),
-            2,
-            "the core admits exactly the declared budget"
-        );
-
-        // The budget is a selection decision, not a post-hoc trim: the report
-        // names the files the surviving plans rewrite and nothing from the
-        // groups the budget refused. A caller that trimmed the returned plans
-        // instead would still hold this report's pre-cap file set.
-        let mut planned: Vec<String> = plans
-            .iter()
-            .flat_map(|plan| plan.file_group.data_files.iter())
-            .map(|task| task.data_file_path.clone())
-            .collect();
-        planned.sort();
-        let reported: Vec<String> = report
-            .selected_paths()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(reported, planned);
-        assert!(
-            report.selected.len() < all_report.selected.len(),
-            "a budgeted pass reports strictly less work than an unbudgeted one"
-        );
-        assert_eq!(
-            report.selected.len(),
-            plans
-                .iter()
-                .map(|plan| plan.file_group.data_file_count)
-                .sum::<usize>(),
-            "report totals equal the budgeted plans' totals"
-        );
-
-        // The admitted plans are the selector's own leading groups, so raising
-        // the budget only ever adds work to the tail.
-        let all_paths: Vec<String> = all_report
-            .selected_paths()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        for path in &reported {
-            assert!(
-                all_paths.contains(path),
-                "a budgeted selection is drawn from the unbudgeted one"
-            );
-        }
-
-        // A zero budget names no work at all, so it is refused at the pass that
-        // could not be planned rather than reported as an empty selection.
-        let refused = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(policy).with_max_selection_plans(0),
-        ))
-        .plan_compaction_with_report(&table, MAIN_BRANCH)
-        .await;
-        assert!(
-            matches!(refused, Err(CompactionError::Config(_))),
-            "a zero plan budget must be refused, got {refused:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn wyrd_selection_refuses_unknown_or_contradictory_snapshot_evidence() {
-        let env = create_test_env().await;
-        let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "evid", 4).await;
-        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
-        let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
-        let policy = forge_policy(&table, "v2", 2_000_000, 1_000_000);
-
-        // A snapshot the table does not carry is unknown evidence, not an
-        // empty selection: planning it would silently report zero work for a
-        // table that may be full of candidates.
-        let unknown = ManifestIdentityIndex::load(&table, snapshot_id + 1_000, None).await;
-        assert!(
-            matches!(unknown, Err(CompactionError::Config(_))),
-            "an unknown snapshot must be refused, got {unknown:?}"
-        );
-
-        // A branch with no snapshot is the same refusal at the planning seam.
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(policy.clone()),
-        ));
-        let absent_branch = planner
-            .plan_compaction_with_report(&table, "no_such_branch")
-            .await;
-        assert!(
-            absent_branch.is_err(),
+            planner
+                .plan_compaction_with_report(&table, "no_such_branch")
+                .await
+                .is_err(),
             "a branch with no snapshot cannot authorise a plan"
         );
-
-        // A report must be bound to a real snapshot. The unassigned sentinel
-        // names no snapshot, so a plan carrying it can never be checked
-        // against the state that authorised it.
-        let one = vec![crate::managed::SelectedFile {
-            file_path: "s3://b/data/forge/v2/part-0/a.parquet".to_owned(),
-            reason: crate::managed::SelectionReason::Undersized,
-        }];
-        let unbound = crate::managed::SelectionReport::new(
-            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
-            UNASSIGNED_SNAPSHOT_ID,
-            Some(policy.identity().unwrap()),
-            one.clone(),
-        );
-        assert!(
-            unbound.is_err(),
-            "a report bound to no snapshot must be refused"
-        );
-
-        // One identity, one reason. Two reasons for one file make the
-        // persisted reason ambiguous.
-        let duplicated = crate::managed::SelectionReport::new(
-            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
-            snapshot_id,
-            Some(policy.identity().unwrap()),
-            vec![one[0].clone(), crate::managed::SelectedFile {
-                file_path: one[0].file_path.clone(),
-                reason: crate::managed::SelectionReason::Oversized,
-            }],
-        );
-        assert!(duplicated.is_err(), "a duplicate identity must be refused");
-
-        // The strategy and its declared identity must agree: the identity-aware
-        // policy always records its inputs, and an upstream policy has none to
-        // record. Either mismatch makes the report describe a decision that
-        // was never taken.
-        let missing_policy = crate::managed::SelectionReport::new(
-            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
-            snapshot_id,
-            None,
-            one.clone(),
-        );
-        assert!(
-            missing_policy.is_err(),
-            "identity-aware selection must record its policy"
-        );
-        let foreign_policy = crate::managed::SelectionReport::new(
-            crate::managed::SelectionStrategyKind::UpstreamSmallFiles,
-            snapshot_id,
-            Some(policy.identity().unwrap()),
-            vec![crate::managed::SelectedFile {
-                file_path: one[0].file_path.clone(),
-                reason: crate::managed::SelectionReason::UpstreamSmallFiles,
-            }],
-        );
-        assert!(
-            foreign_policy.is_err(),
-            "an upstream strategy has no identity policy to declare"
-        );
-
-        // A reason must belong to the strategy that recorded it.
-        let foreign_reason = crate::managed::SelectionReport::new(
-            crate::managed::SelectionStrategyKind::WyrdIdentityAware,
-            snapshot_id,
-            Some(policy.identity().unwrap()),
-            vec![crate::managed::SelectedFile {
-                file_path: one[0].file_path.clone(),
-                reason: crate::managed::SelectionReason::UpstreamFull,
-            }],
-        );
-        assert!(
-            foreign_reason.is_err(),
-            "an upstream reason cannot appear under identity-aware selection"
-        );
-
-        // An unknown wire spelling is rejected on read rather than reinterpreted.
-        assert!(crate::managed::SelectionReason::parse("NotAReason").is_err());
-        assert_eq!(
-            crate::managed::SelectionReason::parse("ObsoleteSchema").unwrap(),
-            crate::managed::SelectionReason::ObsoleteSchema
-        );
-
-        // The accepted report is the one the production path builds.
-        let (plans, report) = planner
-            .plan_compaction_with_report(&table, MAIN_BRANCH)
-            .await
-            .unwrap();
-        assert_eq!(report.base_snapshot_id, snapshot_id);
-        for plan in &plans {
-            assert_eq!(plan.snapshot_id, report.base_snapshot_id);
-        }
     }
 
     #[tokio::test]
@@ -4132,11 +3723,7 @@ mod tests {
         let compaction = CompactionBuilder::new(read_only, env.table_ident.clone())
             .with_config(Arc::new(
                 CompactionConfigBuilder::default()
-                    .planning(CompactionPlanningConfig::WyrdIdentityAware(
-                        crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                            &table, "v2", 2_000_000, 1_000_000,
-                        )),
-                    ))
+                    .planning(small_files_planning(Default::default()))
                     .build()
                     .unwrap(),
             ))
@@ -4181,11 +3768,7 @@ mod tests {
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "compat", 4).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
 
-        let planning = CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                &table, "v2", 2_000_000, 1_000_000,
-            )),
-        );
+        let planning = small_files_planning(Default::default());
         let config = Arc::new(
             CompactionConfigBuilder::default()
                 .planning(planning)
@@ -4278,7 +3861,7 @@ mod tests {
             datafusion::execution::memory_pool::FairSpillPool::new(64 * 1024 * 1024),
         );
         let context = crate::managed::ManagedExecutionContext::builder()
-            .with_memory_pool(pool, Some(64 * 1024 * 1024))
+            .with_memory_pool(pool)
             .with_spill_lease(lease.clone())
             .with_observer(observer.clone())
             .build()
@@ -4288,9 +3871,6 @@ mod tests {
         // scratch root is the only place it may spill.
         let runtime = context.runtime_env();
         assert!(Arc::ptr_eq(&runtime, &context.runtime_env()));
-        assert_eq!(context.pool_capacity_bytes(), Some(64 * 1024 * 1024));
-        assert_eq!(context.peak_memory_bytes(), 0, "nothing reserved yet");
-        assert_eq!(context.spill().unwrap().root(), spill_dir.path());
 
         let executor = DataFusionExecutor::with_context(Arc::clone(&context));
         assert!(
@@ -4303,11 +3883,7 @@ mod tests {
         )
         .with_config(Arc::new(
             CompactionConfigBuilder::default()
-                .planning(CompactionPlanningConfig::WyrdIdentityAware(
-                    crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                        &table, "v2", 2_000_000, 1_000_000,
-                    )),
-                ))
+                .planning(small_files_planning(Default::default()))
                 .build()
                 .unwrap(),
         ))
@@ -4329,31 +3905,6 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!result.output_data_files.is_empty());
-        }
-
-        // The leased pool actually served the work, and its peak is reported
-        // against the capacity the caller admitted.
-        assert!(
-            context.peak_memory_bytes() > 0,
-            "the injected pool must be the one that served the reservations"
-        );
-        let peaks: Vec<(usize, Option<usize>)> = observer
-            .events()
-            .into_iter()
-            .filter_map(|event| match event {
-                crate::managed::RewriteEvent::PeakMemory {
-                    peak_bytes,
-                    pool_capacity_bytes,
-                    ..
-                } => Some((peak_bytes, pool_capacity_bytes)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(peaks.len(), 2, "one peak report per completed attempt");
-        for (peak, capacity) in peaks {
-            assert!(peak > 0);
-            assert_eq!(capacity, Some(64 * 1024 * 1024));
-            assert!(peak <= 64 * 1024 * 1024, "the admitted bound was honoured");
         }
 
         // A caller that has already withdrawn its admission gets a refusal,
@@ -4472,17 +4023,13 @@ mod tests {
             .build()
             .unwrap();
 
-        // Sized so an undersized run flushes after two files: the attempt gets
-        // more than one plan, which is the only way a per-call ledger and an
-        // attempt-owned one can be told apart.
-        let threshold = largest + 1;
-        let target = largest * 2 + 1;
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(crate::managed::WyrdSelectionPolicy {
-                small_file_threshold_bytes: threshold,
-                target_file_size_bytes: target,
-                ..forge_policy(&table, "v2", target, threshold)
-            }),
+        // Bin-packed at two files per group: the attempt gets more than one
+        // plan, which is the only way a per-call ledger and an attempt-owned
+        // one can be told apart.
+        let planner = CompactionPlanner::new(small_files_planning(
+            crate::config::GroupingStrategy::BinPack(crate::config::BinPackConfig::new(
+                largest * 2 + 1,
+            )),
         ));
         let plans = planner
             .plan_compaction_with_branch(&table, MAIN_BRANCH)
@@ -4657,9 +4204,6 @@ mod tests {
             E::OutputOpened { .. } => "OutputOpened",
             E::RollDecided { .. } => "RollDecided",
             E::OutputClosed { .. } => "OutputClosed",
-            E::PeakMemory { .. } => "PeakMemory",
-            E::OperatorSpill { .. } => "OperatorSpill",
-            E::ScratchSpill { .. } => "ScratchSpill",
             E::Succeeded { .. } => "Succeeded",
             E::Failed { .. } => "Failed",
             E::Cancelled { .. } => "Cancelled",
@@ -4672,11 +4216,7 @@ mod tests {
         let files = write_forge_files(&env.table, &env.warehouse_location, "v2", "term", 4).await;
         let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
 
-        let planning = CompactionPlanningConfig::WyrdIdentityAware(
-            crate::config::WyrdIdentityAwareConfig::new(forge_policy(
-                &table, "v2", 2_000_000, 1_000_000,
-            )),
-        );
+        let planning = small_files_planning(Default::default());
         let config = Arc::new(
             CompactionConfigBuilder::default()
                 .planning(planning)
@@ -4693,14 +4233,14 @@ mod tests {
             .unwrap();
         assert!(!plans.is_empty());
 
-        // Success, with resource accounting.
+        // Success under leased resources.
         let spill_dir = TempDir::new().unwrap();
         let success_observer = Arc::new(RecordingRewriteObserver::default());
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
             datafusion::execution::memory_pool::FairSpillPool::new(64 * 1024 * 1024),
         );
         let success_context = crate::managed::ManagedExecutionContext::builder()
-            .with_memory_pool(pool, Some(64 * 1024 * 1024))
+            .with_memory_pool(pool)
             .with_spill_lease(
                 crate::managed::SpillLease::new(spill_dir.path().to_path_buf()).unwrap(),
             )
@@ -4720,19 +4260,6 @@ mod tests {
         assert!(!response.data_files.is_empty());
 
         let success_events = success_observer.events();
-        assert!(
-            success_events
-                .iter()
-                .any(|event| matches!(event, crate::managed::RewriteEvent::PeakMemory { peak_bytes, .. } if *peak_bytes > 0)),
-            "a completed rewrite reports a non-zero peak against the leased pool"
-        );
-        assert!(
-            success_events
-                .iter()
-                .any(|event| matches!(event, crate::managed::RewriteEvent::ScratchSpill { .. })),
-            "a leased scratch root is always accounted for"
-        );
-
         // Balanced: every output the attempt opened reached a close, and the
         // terminal event accounts for all of them as settled. A leaked active
         // output would mean an object nobody closed and nobody reported.

@@ -1,23 +1,21 @@
 //! Caller-bound execution context for exactly one managed rewrite attempt.
 //!
 //! The context carries the resources a caller leases to the core for the
-//! duration of one publication attempt: the `DataFusion` runtime, a memory pool
-//! whose peak is tracked, a scratch root whose lifetime and byte usage the
-//! caller owns, a cancellation token, and the rewrite observer.
+//! duration of one publication attempt: the `DataFusion` runtime, a memory pool,
+//! a scratch root whose lifetime the caller owns, a cancellation token, and the
+//! rewrite observer.
 //!
 //! Leasing rather than constructing is the point. The core does not decide how
 //! much memory an attempt may use, where it may spill, or how long that scratch
-//! lives; it reports what it used and stops when told to. No durable behavior
+//! lives; it charges the caller's pool, spills under the caller's root, and
+//! stops when told to. No durable behavior
 //! moves into the core as a result: the context holds no tenant identity, no
 //! catalog authority, and no commit permission.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use datafusion::execution::memory_pool::{
-    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, UnboundedMemoryPool,
-};
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tokio_util::sync::CancellationToken;
 
@@ -25,107 +23,14 @@ use super::bridge::AttemptLedger;
 use super::observer::{AttemptId, RewriteObserver, noop_observer};
 use crate::error::{CompactionError, Result};
 
-/// Memory pool that records the highest simultaneous reservation it served.
-///
-/// Wraps a caller-supplied pool rather than replacing it, so the caller keeps
-/// control of the actual limit and spill behavior while the core gains an
-/// honest peak figure to report. The peak is a high-water mark of `reserved()`
-/// sampled at every grow, so it never overstates: a value that was never
-/// simultaneously held cannot be recorded.
-#[derive(Debug)]
-pub struct PeakTrackingMemoryPool {
-    inner: Arc<dyn MemoryPool>,
-    peak_bytes: Arc<AtomicUsize>,
-}
-
-impl PeakTrackingMemoryPool {
-    /// Wraps `inner`, publishing its peak through the returned handle.
-    #[must_use]
-    pub fn new(inner: Arc<dyn MemoryPool>) -> Self {
-        Self {
-            inner,
-            peak_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// Returns the shared peak handle, readable while the pool is in use.
-    #[must_use]
-    pub fn peak_handle(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.peak_bytes)
-    }
-
-    /// Records the current reservation as the peak when it is a new high.
-    fn observe_peak(&self) {
-        let current = self.inner.reserved();
-        self.peak_bytes.fetch_max(current, Ordering::Relaxed);
-    }
-}
-
-impl std::fmt::Display for PeakTrackingMemoryPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "PeakTracking(peak={}, inner={})",
-            self.peak_bytes.load(Ordering::Relaxed),
-            self.inner
-        )
-    }
-}
-
-impl MemoryPool for PeakTrackingMemoryPool {
-    /// Reports the wrapped pool's name so diagnostics still identify the real
-    /// limit implementation rather than this transparent wrapper.
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn register(&self, consumer: &MemoryConsumer) {
-        self.inner.register(consumer);
-    }
-
-    fn unregister(&self, consumer: &MemoryConsumer) {
-        self.inner.unregister(consumer);
-    }
-
-    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.inner.grow(reservation, additional);
-        self.observe_peak();
-    }
-
-    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
-        self.inner.shrink(reservation, shrink);
-    }
-
-    fn try_grow(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<()> {
-        self.inner.try_grow(reservation, additional)?;
-        self.observe_peak();
-        Ok(())
-    }
-
-    fn reserved(&self) -> usize {
-        self.inner.reserved()
-    }
-
-    fn memory_limit(&self) -> MemoryLimit {
-        self.inner.memory_limit()
-    }
-}
-
-/// Accounting handle for a caller-leased scratch root.
+/// A caller-leased scratch root.
 ///
 /// The core never creates or removes the root: the caller owns its lifetime,
 /// which is what makes scratch usage auditable against a lease rather than
-/// against whatever the OS temp directory happens to allow. The core only
-/// measures what it put there.
+/// against whatever the OS temp directory happens to allow.
 #[derive(Debug, Clone)]
 pub struct SpillLease {
     root: PathBuf,
-    current_bytes: Arc<AtomicU64>,
-    peak_bytes: Arc<AtomicU64>,
 }
 
 impl SpillLease {
@@ -144,62 +49,13 @@ impl SpillLease {
                 root.display()
             )));
         }
-        Ok(Self {
-            root,
-            current_bytes: Arc::new(AtomicU64::new(0)),
-            peak_bytes: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self { root })
     }
 
     /// Returns the leased scratch root.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Re-measures the bytes currently resident under the root.
-    ///
-    /// Recursion is bounded by the directory tree `DataFusion` itself creates, so
-    /// this is a shallow walk in practice. Entries that vanish between listing
-    /// and stat are skipped rather than failing the attempt: a spill file being
-    /// reclaimed mid-measurement is normal, not an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactionError::Io`] when the root itself cannot be read.
-    pub fn measure(&self) -> Result<u64> {
-        let bytes = Self::directory_bytes(&self.root)?;
-        self.current_bytes.store(bytes, Ordering::Relaxed);
-        self.peak_bytes.fetch_max(bytes, Ordering::Relaxed);
-        Ok(bytes)
-    }
-
-    /// Returns the most recently measured resident bytes.
-    #[must_use]
-    pub fn current_bytes(&self) -> u64 {
-        self.current_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Returns the highest measured byte usage.
-    #[must_use]
-    pub fn peak_bytes(&self) -> u64 {
-        self.peak_bytes.load(Ordering::Relaxed)
-    }
-
-    fn directory_bytes(dir: &Path) -> Result<u64> {
-        let mut total = 0_u64;
-        for entry in std::fs::read_dir(dir)? {
-            let Ok(entry) = entry else { continue };
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                total = total.saturating_add(Self::directory_bytes(&entry.path()).unwrap_or(0));
-            } else if let Ok(metadata) = entry.metadata() {
-                total = total.saturating_add(metadata.len());
-            }
-        }
-        Ok(total)
     }
 }
 
@@ -213,9 +69,6 @@ impl SpillLease {
 pub struct ManagedExecutionContext {
     attempt_id: AttemptId,
     runtime_env: Arc<RuntimeEnv>,
-    peak_memory_bytes: Arc<AtomicUsize>,
-    pool_capacity_bytes: Option<usize>,
-    spill: Option<SpillLease>,
     cancellation: CancellationToken,
     observer: Arc<dyn RewriteObserver>,
     ledger: Arc<AttemptLedger>,
@@ -241,24 +94,6 @@ impl ManagedExecutionContext {
     #[must_use]
     pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
         Arc::clone(&self.runtime_env)
-    }
-
-    /// Returns the highest simultaneous memory reservation observed so far.
-    #[must_use]
-    pub fn peak_memory_bytes(&self) -> usize {
-        self.peak_memory_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Returns the leased pool's capacity when it is bounded.
-    #[must_use]
-    pub fn pool_capacity_bytes(&self) -> Option<usize> {
-        self.pool_capacity_bytes
-    }
-
-    /// Returns the scratch lease, when the caller supplied one.
-    #[must_use]
-    pub fn spill(&self) -> Option<&SpillLease> {
-        self.spill.as_ref()
     }
 
     /// Returns the caller's cancellation token.
@@ -303,9 +138,7 @@ impl ManagedExecutionContext {
 pub struct ManagedExecutionContextBuilder {
     attempt_id: Option<AttemptId>,
     memory_pool: Option<Arc<dyn MemoryPool>>,
-    pool_capacity_bytes: Option<usize>,
     spill: Option<SpillLease>,
-    scratch_capacity_bytes: Option<u64>,
     cancellation: Option<CancellationToken>,
     observer: Option<Arc<dyn RewriteObserver>>,
 }
@@ -318,18 +151,13 @@ impl ManagedExecutionContextBuilder {
         self
     }
 
-    /// Leases a memory pool, recording `capacity_bytes` as its bound.
+    /// Leases a memory pool.
     ///
-    /// The pool is wrapped so its peak is tracked; the caller's own limit and
-    /// spill semantics are unchanged.
+    /// The runtime charges this pool directly, so the caller's own limit and
+    /// spill semantics govern every reservation the attempt makes.
     #[must_use]
-    pub fn with_memory_pool(
-        mut self,
-        pool: Arc<dyn MemoryPool>,
-        capacity_bytes: Option<usize>,
-    ) -> Self {
+    pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
         self.memory_pool = Some(pool);
-        self.pool_capacity_bytes = capacity_bytes;
         self
     }
 
@@ -337,22 +165,6 @@ impl ManagedExecutionContextBuilder {
     #[must_use]
     pub fn with_spill_lease(mut self, spill: SpillLease) -> Self {
         self.spill = Some(spill);
-        self
-    }
-
-    /// Bounds the leased scratch root at exactly `bytes`.
-    ///
-    /// Without this the runtime keeps `DataFusion`'s own default temp-directory
-    /// limit, which has nothing to do with what the caller actually admitted.
-    /// Supplying the admitted figure here is what makes the lease enforceable
-    /// rather than advisory: the runtime refuses the write that would exceed it
-    /// instead of letting an attempt overrun a budget the caller granted.
-    ///
-    /// The value is applied only alongside [`Self::with_spill_lease`]; see
-    /// [`Self::build`] for the refusal when no lease is present.
-    #[must_use]
-    pub fn with_scratch_capacity_bytes(mut self, bytes: u64) -> Self {
-        self.scratch_capacity_bytes = Some(bytes);
         self
     }
 
@@ -372,45 +184,27 @@ impl ManagedExecutionContextBuilder {
 
     /// Builds the context, constructing the leased runtime.
     ///
-    /// The runtime is built here rather than accepted whole so the peak-tracking
-    /// wrapper and the leased scratch root are guaranteed to be installed: a
-    /// caller cannot hand in a runtime that silently spills somewhere the lease
-    /// does not account for.
+    /// The runtime is built here rather than accepted whole so the leased pool
+    /// and the leased scratch root are guaranteed to be installed: a caller
+    /// cannot hand in a runtime that silently spills somewhere the lease does
+    /// not account for.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactionError::Config`] when a scratch capacity was supplied
-    /// without a spill lease, since there would be no directory to bound, and
-    /// [`CompactionError::DataFusion`] when the runtime cannot be built.
+    /// Returns [`CompactionError::DataFusion`] when the runtime cannot be built.
     pub fn build(self) -> Result<Arc<ManagedExecutionContext>> {
-        let inner_pool = self
+        let pool = self
             .memory_pool
             .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()) as Arc<dyn MemoryPool>);
-        let tracking = PeakTrackingMemoryPool::new(inner_pool);
-        let peak_memory_bytes = tracking.peak_handle();
-
-        let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(tracking));
-        match (self.spill.as_ref(), self.scratch_capacity_bytes) {
-            (Some(spill), capacity) => {
-                let mut disk = datafusion::execution::disk_manager::DiskManagerBuilder::default()
-                    .with_mode(
-                        datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
-                            spill.root().to_path_buf(),
-                        ]),
-                    );
-                // Applied only when the caller named a figure, so a caller with
-                // no scratch policy keeps DataFusion's own default limit.
-                if let Some(bytes) = capacity {
-                    disk = disk.with_max_temp_directory_size(bytes);
-                }
-                runtime = runtime.with_disk_manager_builder(disk);
-            }
-            (None, Some(_)) => {
-                return Err(CompactionError::Config(
-                    "scratch capacity requires a spill lease".to_owned(),
-                ));
-            }
-            (None, None) => {}
+        let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(pool);
+        if let Some(spill) = self.spill.as_ref() {
+            runtime = runtime.with_disk_manager_builder(
+                datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(
+                    datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
+                        spill.root().to_path_buf(),
+                    ]),
+                ),
+            );
         }
 
         let attempt_id = self.attempt_id.unwrap_or_default();
@@ -420,9 +214,6 @@ impl ManagedExecutionContextBuilder {
         Ok(Arc::new(ManagedExecutionContext {
             attempt_id,
             runtime_env: runtime.build_arc()?,
-            peak_memory_bytes,
-            pool_capacity_bytes: self.pool_capacity_bytes,
-            spill: self.spill,
             cancellation: self.cancellation.unwrap_or_default(),
             observer,
             ledger,
@@ -432,79 +223,48 @@ impl ManagedExecutionContextBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
 
     use super::*;
 
-    /// The leased scratch root is bounded at exactly the admitted byte figure.
+    /// The runtime charges the leased pool and spills under the leased root.
     ///
-    /// A lease the runtime does not enforce is a comment: the attempt would
-    /// spill past whatever the caller admitted and the caller would find out
-    /// from the filesystem. This asserts both halves — that the runtime carries
-    /// the exact figure, and that a tracked spill file crossing it is refused
-    /// by `DataFusion` itself rather than by anything this crate adds.
+    /// Both leases are the caller's governance: a reservation the leased pool
+    /// does not see, or a spill file outside the leased root, would escape the
+    /// budget the caller admitted.
     ///
     /// # Panics
     ///
-    /// Panics when the context cannot be built, when the runtime carries a
-    /// different limit, or when an over-limit spill is accepted.
+    /// Panics when the context cannot be built, when a reservation bypasses the
+    /// leased pool, or when a spill file lands outside the leased root.
     #[test]
-    fn managed_context_enforces_exact_scratch_limit() {
-        const LIMIT: u64 = 4096;
-
+    fn managed_context_charges_leased_pool_and_spills_under_leased_root() {
         let root = tempfile::tempdir().expect("scratch root");
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
         let context = ManagedExecutionContext::builder()
+            .with_memory_pool(Arc::clone(&pool))
             .with_spill_lease(SpillLease::new(root.path()).expect("the scratch root exists"))
-            .with_scratch_capacity_bytes(LIMIT)
             .build()
             .expect("a leased context builds");
         let runtime = context.runtime_env();
-        assert_eq!(
-            runtime.disk_manager.max_temp_directory_size(),
-            LIMIT,
-            "the runtime enforces exactly the admitted scratch lease"
+
+        let reservation = MemoryConsumer::new("lease").register(&runtime.memory_pool);
+        reservation.try_grow(512).expect("a grant inside the lease");
+        assert_eq!(pool.reserved(), 512, "the runtime charges the leased pool");
+        assert!(
+            reservation.try_grow(1024).is_err(),
+            "the leased pool's own limit refuses an overdraw"
         );
 
         let spill = runtime
             .disk_manager
             .create_tmp_file("managed scratch lease")
             .expect("a spill file inside the lease is created");
-        let mut writer = spill.open_writer().expect("the spill file is writable");
-        let chunk = vec![0_u8; usize::try_from(LIMIT).expect("the limit fits a usize")];
-        writer
-            .write_all(&chunk)
-            .expect("a spill up to the lease is accepted");
-        let refusal = writer
-            .write_all(&chunk)
-            .expect_err("a spill crossing the lease is refused");
         assert!(
-            refusal.to_string().contains("exceeded the allowable limit"),
-            "the refusal is DataFusion's own temp-directory limit: {refusal}"
-        );
-        assert_eq!(
-            runtime.disk_manager.used_disk_space(),
-            LIMIT,
-            "the refused write left the lease exactly full, not overdrawn"
-        );
-    }
-
-    /// A scratch capacity without a scratch root is a configuration error.
-    ///
-    /// There is no directory to bound, so silently ignoring the figure would
-    /// leave a caller believing a limit is in force when nothing enforces it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the build succeeds or returns another error.
-    #[test]
-    fn managed_context_refuses_scratch_capacity_without_a_lease() {
-        let error = ManagedExecutionContext::builder()
-            .with_scratch_capacity_bytes(4096)
-            .build()
-            .expect_err("a capacity with no lease cannot be honored");
-        assert!(
-            matches!(error, CompactionError::Config(_)),
-            "the refusal is a configuration error: {error}"
+            spill
+                .path()
+                .is_some_and(|path| path.starts_with(root.path())),
+            "spill files land under the leased root"
         );
     }
 }
