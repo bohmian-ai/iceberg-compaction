@@ -32,6 +32,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
+use iceberg::metadata_columns::{last_updated_sequence_number_field, row_id_field};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     DataContentType, FormatVersion, NestedField, PartitionSpecRef, PrimitiveType, Schema,
@@ -866,16 +867,30 @@ impl DataFusionTaskContextBuilder {
         let need_file_path_and_pos = !ge_v3_format && !self.position_delete_files.is_empty();
         let need_seq_num = !equality_delete_metadatas.is_empty();
 
-        // Build schema for data file, old schema + seq_num + file_path + pos
+        // A v3 rewrite reads and writes the row-lineage metadata columns beside the
+        // logical columns, so every surviving row keeps its `_row_id` and
+        // `_last_updated_sequence_number`. They live only in the internal scan and writer
+        // schemas, never in the table schema.
+        let lineage_fields = if ge_v3_format {
+            vec![
+                row_id_field().clone(),
+                last_updated_sequence_number_field().clone(),
+            ]
+        } else {
+            vec![]
+        };
+
+        // Build schema for data file, old schema + lineage + seq_num + file_path + pos
         let project_names: Vec<_> = self
             .schema
             .as_struct()
             .fields()
             .iter()
+            .chain(&lineage_fields)
             .map(|i| i.name.clone())
             .collect();
         let highest_field_id = self.schema.highest_field_id();
-        let mut add_schema_fields = vec![];
+        let mut add_schema_fields = lineage_fields.clone();
         // add sequence number column if needed
         if need_seq_num {
             add_schema_fields.push(Arc::new(NestedField::new(
@@ -908,8 +923,14 @@ impl DataFusionTaskContextBuilder {
             .into_builder()
             .with_fields(add_schema_fields)
             .build()?;
-        // input schema is old schema. used for data file writer
-        let input_schema = self.schema.as_ref().clone();
+        // input schema is old schema plus any lineage columns. used for data file writer
+        let input_schema = self
+            .schema
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields(lineage_fields)
+            .build()?;
 
         let sql_builder = SqlBuilder::new(
             &project_names,

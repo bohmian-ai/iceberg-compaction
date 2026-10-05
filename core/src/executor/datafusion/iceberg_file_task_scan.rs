@@ -21,8 +21,8 @@ use std::vec;
 
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
@@ -37,7 +37,9 @@ use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
 use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
 };
 use iceberg::scan::FileScanTask;
 use iceberg::spec::DataContentType;
@@ -192,6 +194,10 @@ impl IcebergFileTaskScan {
                             (DataContentType::PositionDeletes, SYS_HIDDEN_POS) => {
                                 Some(RESERVED_FIELD_ID_DELETE_FILE_POS)
                             }
+                            (DataContentType::Data, _) => task
+                                .schema()
+                                .field_id_by_name(name)
+                                .or_else(|| row_lineage_field_id(name)),
                             _ => task.schema().field_id_by_name(name),
                         })
                         .collect::<Vec<_>>();
@@ -463,6 +469,7 @@ async fn get_batch_stream(
                 let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match file_context.data_file_content {
                     DataContentType::Data => {
+                        batch = decode_run_end_columns(batch)?;
                         // add sequence number if needed
                         if need_seq_num {
                             batch = add_seq_num_into_batch(batch, file_context.sequence_number)?;
@@ -638,6 +645,46 @@ fn generate_memory_path(original_path: &str) -> String {
     format!("memory:/{}", original_path.replace("://", "/"))
 }
 
+/// Replaces every run-end-encoded column with its plain values array.
+///
+/// The reader materializes per-file constant metadata columns, such as a v3
+/// `_last_updated_sequence_number` derived from the data sequence number, as
+/// run-end-encoded arrays. The rewrite plan declares those columns with their plain
+/// Iceberg type, so each batch is decoded before it reaches `DataFusion` or the writer.
+fn decode_run_end_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), DataType::RunEndEncoded(_, _)))
+    {
+        return Ok(batch);
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        match field.data_type() {
+            DataType::RunEndEncoded(_, values) => {
+                columns.push(cast(column, values.data_type())?);
+                fields.push(Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(values.data_type().clone()),
+                ));
+            }
+            _ => {
+                columns.push(Arc::clone(column));
+                fields.push(Arc::clone(field));
+            }
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )?)
+}
+
 /// Adds a sequence number column to a record batch
 fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBatch> {
     let schema = batch.schema();
@@ -706,6 +753,21 @@ impl DisplayAs for IcebergFileTaskScan {
                 .clone()
                 .map_or(String::from(""), |p| format!("{}", p))
         )
+    }
+}
+
+/// Resolves a row-lineage metadata column name to its reserved field id.
+///
+/// A v3 rewrite projects `_row_id` and `_last_updated_sequence_number` beside the logical
+/// columns; neither is part of the table schema, so the data-file scan maps them to the
+/// reserved ids the reader synthesizes or reads physically.
+fn row_lineage_field_id(name: &str) -> Option<i32> {
+    match name {
+        RESERVED_COL_NAME_ROW_ID => Some(RESERVED_FIELD_ID_ROW_ID),
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER => {
+            Some(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
+        }
+        _ => None,
     }
 }
 

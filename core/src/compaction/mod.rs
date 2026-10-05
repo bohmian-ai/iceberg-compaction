@@ -3286,6 +3286,143 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
+    /// Reads every live row's `(_row_id, _last_updated_sequence_number, id, name)` through a
+    /// table scan, keyed by `_row_id`, asserting no row id repeats.
+    async fn row_lineage(table: &Table) -> std::collections::BTreeMap<i64, (i64, i32, String)> {
+        use datafusion::arrow::array::{Array, Int64Array};
+        use datafusion::arrow::compute::cast;
+        use datafusion::arrow::datatypes::DataType;
+        use futures::TryStreamExt;
+
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .select(["id", "name", "_row_id", "_last_updated_sequence_number"])
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = std::collections::BTreeMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let row_ids = batch
+                .column_by_name("_row_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let seqs = cast(
+                batch
+                    .column_by_name("_last_updated_sequence_number")
+                    .unwrap(),
+                &DataType::Int64,
+            )
+            .unwrap();
+            let seqs = seqs.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(row_ids.null_count(), 0);
+            assert_eq!(seqs.null_count(), 0);
+            for row in 0..batch.num_rows() {
+                let previous = rows.insert(
+                    row_ids.value(row),
+                    (seqs.value(row), ids.value(row), names.value(row).to_owned()),
+                );
+                assert!(
+                    previous.is_none(),
+                    "duplicate _row_id {}",
+                    row_ids.value(row)
+                );
+            }
+        }
+        rows
+    }
+
+    /// A v3 rewrite keeps every surviving row's `_row_id` and `_last_updated_sequence_number`
+    /// across repeated compactions, writes both as physical columns with their reserved field
+    /// ids, and never adds them to the table schema.
+    #[tokio::test]
+    async fn rewrite_preserves_v3_row_lineage() {
+        use iceberg::metadata_columns::{
+            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+        };
+        use iceberg::spec::FormatVersion;
+
+        let env = create_test_env().await;
+        let table_ident = TableIdent::new(env.table_ident.namespace.clone(), "v3_table".into());
+        let _ = env
+            .catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(simple_table_schema())
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let mut table = env.catalog.load_table(&table_ident).await.unwrap();
+
+        // One commit per file gives every file its own first_row_id and sequence number.
+        for i in 0..3 {
+            let files =
+                write_simple_files(&table, &env.warehouse_location, &format!("v3_{i}"), 1).await;
+            table = append_and_commit(&table, env.catalog.as_ref(), files).await;
+        }
+        let before = row_lineage(&table).await;
+        assert_eq!(before.len(), 9);
+        let distinct_seqs: HashSet<i64> = before.values().map(|(seq, _, _)| *seq).collect();
+        assert_eq!(distinct_seqs.len(), 3);
+
+        let mut expected = before.clone();
+        for round in 0..2 {
+            let compaction = create_default_compaction(env.catalog.clone(), table_ident.clone());
+            let result = compaction.compact().await.unwrap().unwrap();
+            table = result.table.unwrap();
+
+            assert_eq!(row_lineage(&table).await, expected, "round {round}");
+            assert_eq!(
+                table.metadata().current_schema().as_ref(),
+                &simple_table_schema().into_builder().build().unwrap()
+            );
+            for file in load_data_files_from_snapshot(&table, MAIN_BRANCH).await {
+                for field_id in [
+                    RESERVED_FIELD_ID_ROW_ID,
+                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                ] {
+                    assert_eq!(file.null_value_counts().get(&field_id), Some(&0));
+                    assert_eq!(
+                        file.value_counts().get(&field_id),
+                        Some(&file.record_count())
+                    );
+                }
+            }
+
+            // A fresh append before the second rewrite mixes physically-stored lineage with
+            // lineage synthesized from first_row_id.
+            if round == 0 {
+                let files = write_simple_files(&table, &env.warehouse_location, "v3_late", 1).await;
+                table = append_and_commit(&table, env.catalog.as_ref(), files).await;
+                expected = row_lineage(&table).await;
+                assert_eq!(expected.len(), 12);
+                assert!(before.iter().all(|(id, row)| expected.get(id) == Some(row)));
+            }
+        }
+    }
+
     /// Custom snapshot metadata from the previous snapshot should get through compaction
     #[tokio::test]
     async fn test_custom_snapshot_metadata_preserved_after_compaction() {
