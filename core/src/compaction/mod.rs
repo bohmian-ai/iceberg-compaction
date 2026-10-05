@@ -472,31 +472,6 @@ impl Compaction {
         }
     }
 
-    /// Generates compaction plans together with the durable selection report.
-    ///
-    /// The additive counterpart to [`plan_compaction`](Self::plan_compaction):
-    /// same plans, plus the complete account of why each file is in them. The
-    /// caller persists the report in its durable plan before an attempt exists,
-    /// so a later attempt is checkable against the decision that authorised it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no config is set, when the table cannot be loaded,
-    /// or when planning or report construction fails.
-    pub async fn plan_compaction_with_report(
-        &self,
-    ) -> Result<(Vec<CompactionPlan>, SelectionReport)> {
-        let Some(config) = &self.config else {
-            return Err(CompactionError::Execution(
-                "CompactionConfig is required for planning".to_owned(),
-            ));
-        };
-        let table = self.catalog.load_table(&self.table_ident).await?;
-        CompactionPlanner::new(config.planning.clone())
-            .plan_compaction_with_report(&table, &self.to_branch)
-            .await
-    }
-
     /// Commits multiple rewrite results in a single Iceberg transaction.
     ///
     /// # Errors
@@ -3731,7 +3706,10 @@ mod tests {
             .build();
 
         // Planning reads only.
-        let (plans, report) = compaction.plan_compaction_with_report().await.unwrap();
+        let (plans, report) = CompactionPlanner::new(small_files_planning(Default::default()))
+            .plan_compaction_with_report(&table, MAIN_BRANCH)
+            .await
+            .unwrap();
         assert!(!plans.is_empty());
         assert!(!report.selected.is_empty());
 
