@@ -18,16 +18,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::StreamExt;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::io::FileIO;
-use iceberg::metadata_columns::{
-    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
-};
-use iceberg::spec::{DataFile, FormatVersion, PartitionSpec, Schema};
+use iceberg::spec::{DataFile, PartitionSpec, Schema};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -248,7 +244,6 @@ impl CompactionExecutor for DataFusionExecutor {
         // objects nobody is waiting for.
         let mut writers: JoinSet<std::result::Result<Vec<DataFile>, CompactionError>> =
             JoinSet::new();
-        let preserve_lineage = format_version >= FormatVersion::V3;
 
         // build iceberg writer for each partition
         for mut batch_stream in batches {
@@ -301,9 +296,6 @@ impl CompactionExecutor for DataFusionExecutor {
                     }
 
                     let batch = batch_result?;
-                    if preserve_lineage {
-                        validate_row_lineage(&batch)?;
-                    }
 
                     let record_count = batch.num_rows() as u64;
                     let batch_bytes = batch.get_array_memory_size() as u64;
@@ -401,43 +393,6 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
-/// Checks one rewrite batch's row-lineage columns before it is written.
-///
-/// A v3 rewrite must write the exact `_row_id` and `_last_updated_sequence_number` of every
-/// surviving row. Either column missing, not `Int64`, or holding a null fails the rewrite
-/// before the batch is written, so no output with lost lineage is ever returned for commit.
-///
-/// # Errors
-///
-/// Returns [`CompactionError::Execution`] when a lineage column is missing, has a non-`Int64`
-/// type, or contains a null.
-fn validate_row_lineage(batch: &RecordBatch) -> Result<()> {
-    let lineage_column = |name: &str| -> Result<()> {
-        let column = batch.column_by_name(name).ok_or_else(|| {
-            CompactionError::Execution(format!("v3 rewrite batch is missing lineage column {name}"))
-        })?;
-        let values = column
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                CompactionError::Execution(format!(
-                    "v3 rewrite lineage column {name} must be Int64, got {}",
-                    column.data_type()
-                ))
-            })?;
-        if values.null_count() > 0 {
-            return Err(CompactionError::Execution(format!(
-                "v3 rewrite lineage column {name} has {} null values",
-                values.null_count()
-            )));
-        }
-        Ok(())
-    };
-    lineage_column(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)?;
-    lineage_column(RESERVED_COL_NAME_ROW_ID)?;
-    Ok(())
-}
-
 /// Builds the writer stack for one output partition of a rewrite.
 ///
 /// `observer`, when present, is attached to the rolling writer so every output
@@ -515,52 +470,4 @@ pub fn build_iceberg_data_file_writer(
     );
 
     Ok(Box::new(iceberg_task_writer))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
-
-    use super::validate_row_lineage;
-
-    /// Builds a batch from named columns.
-    fn batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
-        RecordBatch::try_from_iter(columns).unwrap()
-    }
-
-    /// Missing, null, and mistyped lineage each fail; complete lineage passes.
-    #[test]
-    fn row_lineage_is_complete() {
-        let ids = || Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef;
-        let seqs = || Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef;
-
-        validate_row_lineage(&batch(vec![
-            ("_row_id", ids()),
-            ("_last_updated_sequence_number", seqs()),
-        ]))
-        .unwrap();
-
-        for bad in [
-            batch(vec![("_row_id", ids())]),
-            batch(vec![("_last_updated_sequence_number", seqs())]),
-            batch(vec![
-                (
-                    "_row_id",
-                    Arc::new(Int64Array::from(vec![Some(7), None])) as ArrayRef,
-                ),
-                ("_last_updated_sequence_number", seqs()),
-            ]),
-            batch(vec![
-                (
-                    "_row_id",
-                    Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
-                ),
-                ("_last_updated_sequence_number", seqs()),
-            ]),
-        ] {
-            assert!(validate_row_lineage(&bad).is_err());
-        }
-    }
 }
