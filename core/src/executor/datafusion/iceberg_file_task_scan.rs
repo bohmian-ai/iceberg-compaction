@@ -37,9 +37,9 @@ use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
 use iceberg::metadata_columns::{
-    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+    get_metadata_field_id,
 };
 use iceberg::scan::FileScanTask;
 use iceberg::spec::DataContentType;
@@ -194,10 +194,19 @@ impl IcebergFileTaskScan {
                             (DataContentType::PositionDeletes, SYS_HIDDEN_POS) => {
                                 Some(RESERVED_FIELD_ID_DELETE_FILE_POS)
                             }
-                            (DataContentType::Data, _) => task
-                                .schema()
-                                .field_id_by_name(name)
-                                .or_else(|| row_lineage_field_id(name)),
+                            (DataContentType::Data, _) => {
+                                task.schema().field_id_by_name(name).or_else(|| {
+                                    // v3 rewrites project the row-lineage columns,
+                                    // which live outside the table schema.
+                                    get_metadata_field_id(name).ok().filter(|id| {
+                                        [
+                                            RESERVED_FIELD_ID_ROW_ID,
+                                            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                                        ]
+                                        .contains(id)
+                                    })
+                                })
+                            }
                             _ => task.schema().field_id_by_name(name),
                         })
                         .collect::<Vec<_>>();
@@ -753,21 +762,6 @@ impl DisplayAs for IcebergFileTaskScan {
                 .clone()
                 .map_or(String::from(""), |p| format!("{}", p))
         )
-    }
-}
-
-/// Resolves a row-lineage metadata column name to its reserved field id.
-///
-/// A v3 rewrite projects `_row_id` and `_last_updated_sequence_number` beside the logical
-/// columns; neither is part of the table schema, so the data-file scan maps them to the
-/// reserved ids the reader synthesizes or reads physically.
-fn row_lineage_field_id(name: &str) -> Option<i32> {
-    match name {
-        RESERVED_COL_NAME_ROW_ID => Some(RESERVED_FIELD_ID_ROW_ID),
-        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER => {
-            Some(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
-        }
-        _ => None,
     }
 }
 
