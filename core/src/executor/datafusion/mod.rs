@@ -246,7 +246,7 @@ impl CompactionExecutor for DataFusionExecutor {
         // A JoinSet rather than detached handles: dropping it aborts every
         // writer task, so no writer survives an early return and keeps writing
         // objects nobody is waiting for.
-        let mut writers: JoinSet<std::result::Result<(Vec<DataFile>, Vec<i64>), CompactionError>> =
+        let mut writers: JoinSet<std::result::Result<Vec<DataFile>, CompactionError>> =
             JoinSet::new();
         let preserve_lineage = format_version >= FormatVersion::V3;
 
@@ -275,9 +275,6 @@ impl CompactionExecutor for DataFusionExecutor {
                     writer_observer,
                 )?;
 
-                // Row ids this writer emitted, checked for uniqueness across the rewrite.
-                let mut row_ids: Vec<i64> = Vec::new();
-
                 // Process each record batch with metrics
                 let mut fetch_batch_start = Instant::now();
                 loop {
@@ -305,7 +302,7 @@ impl CompactionExecutor for DataFusionExecutor {
 
                     let batch = batch_result?;
                     if preserve_lineage {
-                        collect_row_lineage(&batch, &mut row_ids)?;
+                        validate_row_lineage(&batch)?;
                     }
 
                     let record_count = batch.num_rows() as u64;
@@ -328,21 +325,17 @@ impl CompactionExecutor for DataFusionExecutor {
                     fetch_batch_start = Instant::now(); // Reset for next batch
                 }
 
-                Ok((data_file_writer.close().await?, row_ids))
+                Ok(data_file_writer.close().await?)
             });
         }
 
         // Drain every writer regardless of outcome. Returning on the first
         // error would leave siblings running and their objects unaccounted for.
         let mut output_data_files: Vec<DataFile> = Vec::new();
-        let mut row_ids: Vec<i64> = Vec::new();
         let mut first_error: Option<CompactionError> = None;
         while let Some(joined) = writers.join_next().await {
             match joined {
-                Ok(Ok((files, writer_row_ids))) => {
-                    output_data_files.extend(files);
-                    row_ids.extend(writer_row_ids);
-                }
+                Ok(Ok(files)) => output_data_files.extend(files),
                 Ok(Err(err)) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -354,10 +347,6 @@ impl CompactionExecutor for DataFusionExecutor {
                     }
                 }
             }
-        }
-
-        if first_error.is_none() && preserve_lineage {
-            first_error = ensure_unique_row_ids(row_ids).err();
         }
 
         let Some(context) = self.context.as_ref() else {
@@ -412,7 +401,7 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
-/// Checks one rewrite batch's row-lineage columns and records its row ids.
+/// Checks one rewrite batch's row-lineage columns before it is written.
 ///
 /// A v3 rewrite must write the exact `_row_id` and `_last_updated_sequence_number` of every
 /// surviving row. Either column missing, not `Int64`, or holding a null fails the rewrite
@@ -422,8 +411,8 @@ impl CompactionExecutor for DataFusionExecutor {
 ///
 /// Returns [`CompactionError::Execution`] when a lineage column is missing, has a non-`Int64`
 /// type, or contains a null.
-fn collect_row_lineage(batch: &RecordBatch, row_ids: &mut Vec<i64>) -> Result<()> {
-    let lineage_column = |name: &str| -> Result<&Int64Array> {
+fn validate_row_lineage(batch: &RecordBatch) -> Result<()> {
+    let lineage_column = |name: &str| -> Result<()> {
         let column = batch.column_by_name(name).ok_or_else(|| {
             CompactionError::Execution(format!("v3 rewrite batch is missing lineage column {name}"))
         })?;
@@ -442,33 +431,11 @@ fn collect_row_lineage(batch: &RecordBatch, row_ids: &mut Vec<i64>) -> Result<()
                 values.null_count()
             )));
         }
-        Ok(values)
+        Ok(())
     };
     lineage_column(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)?;
-    row_ids.extend(
-        lineage_column(RESERVED_COL_NAME_ROW_ID)?
-            .values()
-            .iter()
-            .copied(),
-    );
+    lineage_column(RESERVED_COL_NAME_ROW_ID)?;
     Ok(())
-}
-
-/// Fails when any `_row_id` appears more than once across a rewrite's outputs.
-///
-/// # Errors
-///
-/// Returns [`CompactionError::Execution`] naming the first duplicated row id.
-// ponytail: holds one i64 per rewritten row; bound rewrite size if that ever matters.
-fn ensure_unique_row_ids(mut row_ids: Vec<i64>) -> Result<()> {
-    row_ids.sort_unstable();
-    match row_ids.windows(2).find(|pair| pair[0] == pair[1]) {
-        Some(pair) => Err(CompactionError::Execution(format!(
-            "v3 rewrite produced duplicate _row_id {}",
-            pair[0]
-        ))),
-        None => Ok(()),
-    }
 }
 
 /// Builds the writer stack for one output partition of a rewrite.
@@ -556,29 +523,24 @@ mod tests {
 
     use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
 
-    use super::{collect_row_lineage, ensure_unique_row_ids};
+    use super::validate_row_lineage;
 
     /// Builds a batch from named columns.
     fn batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
         RecordBatch::try_from_iter(columns).unwrap()
     }
 
-    /// Missing, null, mistyped, and duplicate lineage each fail; complete lineage is recorded.
+    /// Missing, null, and mistyped lineage each fail; complete lineage passes.
     #[test]
-    fn row_lineage_is_complete_and_unique() {
+    fn row_lineage_is_complete() {
         let ids = || Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef;
         let seqs = || Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef;
-        let mut row_ids = Vec::new();
 
-        collect_row_lineage(
-            &batch(vec![
-                ("_row_id", ids()),
-                ("_last_updated_sequence_number", seqs()),
-            ]),
-            &mut row_ids,
-        )
+        validate_row_lineage(&batch(vec![
+            ("_row_id", ids()),
+            ("_last_updated_sequence_number", seqs()),
+        ]))
         .unwrap();
-        assert_eq!(row_ids, vec![7, 8]);
 
         for bad in [
             batch(vec![("_row_id", ids())]),
@@ -598,10 +560,7 @@ mod tests {
                 ("_last_updated_sequence_number", seqs()),
             ]),
         ] {
-            assert!(collect_row_lineage(&bad, &mut Vec::new()).is_err());
+            assert!(validate_row_lineage(&bad).is_err());
         }
-
-        assert!(ensure_unique_row_ids(vec![3, 1, 2]).is_ok());
-        assert!(ensure_unique_row_ids(vec![3, 1, 3]).is_err());
     }
 }
