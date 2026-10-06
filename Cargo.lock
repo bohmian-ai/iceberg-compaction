@@ -2991,7 +2991,6 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
- "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -4548,6 +4547,7 @@ dependencies = [
 name = "rest-catalog-example"
 version = "0.1.0"
 dependencies = [
+ "iceberg-catalog-rest",
  "iceberg-compaction-core",
  "tokio",
 ]
