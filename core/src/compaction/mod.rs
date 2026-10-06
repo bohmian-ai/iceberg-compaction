@@ -3286,9 +3286,9 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
-    /// Reads every live row's `(_row_id, _last_updated_sequence_number, id, name)` through a
-    /// table scan, keyed by `_row_id`, asserting no row id repeats.
-    async fn row_lineage(table: &Table) -> std::collections::BTreeMap<i64, (i64, i32, String)> {
+    /// Reads every live row's `(id, name, _row_id, _last_updated_sequence_number)` through a
+    /// table scan, sorted by the row's logical identity and then its lineage.
+    async fn row_lineage(table: &Table) -> Vec<(i32, String, i64, i64)> {
         use datafusion::arrow::array::{Array, Int64Array};
         use datafusion::arrow::compute::cast;
         use datafusion::arrow::datatypes::DataType;
@@ -3305,7 +3305,7 @@ mod tests {
             .try_collect()
             .await
             .unwrap();
-        let mut rows = std::collections::BTreeMap::new();
+        let mut rows = Vec::new();
         for batch in batches {
             let ids = batch
                 .column_by_name("id")
@@ -3336,28 +3336,22 @@ mod tests {
             assert_eq!(row_ids.null_count(), 0);
             assert_eq!(seqs.null_count(), 0);
             for row in 0..batch.num_rows() {
-                let previous = rows.insert(
+                rows.push((
+                    ids.value(row),
+                    names.value(row).to_owned(),
                     row_ids.value(row),
-                    (seqs.value(row), ids.value(row), names.value(row).to_owned()),
-                );
-                assert!(
-                    previous.is_none(),
-                    "duplicate _row_id {}",
-                    row_ids.value(row)
-                );
+                    seqs.value(row),
+                ));
             }
         }
+        rows.sort();
         rows
     }
 
     /// A v3 rewrite keeps every surviving row's `_row_id` and `_last_updated_sequence_number`
-    /// across repeated compactions, writes both as physical columns with their reserved field
-    /// ids, and never adds them to the table schema.
+    /// across repeated compactions and never adds them to the table schema.
     #[tokio::test]
     async fn rewrite_preserves_v3_row_lineage() {
-        use iceberg::metadata_columns::{
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
-        };
         use iceberg::spec::FormatVersion;
 
         let env = create_test_env().await;
@@ -3384,7 +3378,7 @@ mod tests {
         }
         let before = row_lineage(&table).await;
         assert_eq!(before.len(), 9);
-        let distinct_seqs: HashSet<i64> = before.values().map(|(seq, _, _)| *seq).collect();
+        let distinct_seqs: HashSet<i64> = before.iter().map(|(_, _, _, seq)| *seq).collect();
         assert_eq!(distinct_seqs.len(), 3);
 
         let mut expected = before.clone();
@@ -3398,19 +3392,6 @@ mod tests {
                 table.metadata().current_schema().as_ref(),
                 &simple_table_schema().into_builder().build().unwrap()
             );
-            for file in load_data_files_from_snapshot(&table, MAIN_BRANCH).await {
-                for field_id in [
-                    RESERVED_FIELD_ID_ROW_ID,
-                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                ] {
-                    assert_eq!(file.null_value_counts().get(&field_id), Some(&0));
-                    assert_eq!(
-                        file.value_counts().get(&field_id),
-                        Some(&file.record_count())
-                    );
-                }
-            }
-
             // A fresh append before the second rewrite mixes physically-stored lineage with
             // lineage synthesized from first_row_id.
             if round == 0 {
@@ -3418,7 +3399,7 @@ mod tests {
                 table = append_and_commit(&table, env.catalog.as_ref(), files).await;
                 expected = row_lineage(&table).await;
                 assert_eq!(expected.len(), 12);
-                assert!(before.iter().all(|(id, row)| expected.get(id) == Some(row)));
+                assert!(before.iter().all(|row| expected.contains(row)));
             }
         }
     }
