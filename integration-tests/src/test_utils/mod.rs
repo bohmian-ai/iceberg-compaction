@@ -83,7 +83,7 @@ impl MockRestCatalogConfig {
         props.insert(S3_SECRET_ACCESS_KEY.to_owned(), self.s3_secret_key.clone());
         props.insert(S3_REGION.to_owned(), self.s3_region.clone());
         props.insert(REST_CATALOG_PROP_URI.to_owned(), self.catalog_uri.clone());
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+        iceberg_catalog_rest::RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
             .load("rest", props)
             .await
