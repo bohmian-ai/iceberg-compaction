@@ -20,9 +20,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::io::FileIO;
+use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataFile, PartitionSpec, Schema};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -31,6 +32,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::{
     RollingFileWriterBuilder, RollingWriterObserver,
 };
+use iceberg::writer::file_writer::variant_shredding::{VariantLayout, VariantShreddingPolicy};
 use iceberg::writer::file_writer::{ParquetWriterBuilder, VariantParquetWriterBuilder};
 use iceberg::writer::{IcebergWriter, TaskWriter};
 use tokio::task::JoinSet;
@@ -197,6 +199,13 @@ impl CompactionExecutor for DataFusionExecutor {
         } = request;
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
+        let variant_layout = combined_variant_layout(
+            &file_io,
+            &schema,
+            &file_group.data_files,
+            &execution_config.variant_shredding,
+        )
+        .await?;
         let sort_order_id = sort_order.clone().map(|sort_order| sort_order.id as i32);
 
         // Extract parallelism before file_group is moved
@@ -257,6 +266,7 @@ impl CompactionExecutor for DataFusionExecutor {
                 .as_ref()
                 .map(|ledger| ledger.writer_bridge() as Arc<dyn RollingWriterObserver>);
             let task_cancellation = cancellation.clone();
+            let variant_layout = variant_layout.clone();
 
             writers.spawn(async move {
                 let mut data_file_writer = build_iceberg_data_file_writer(
@@ -267,6 +277,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     partition_spec,
                     sort_order_id,
                     execution_config,
+                    variant_layout,
                     writer_observer,
                 )?;
 
@@ -393,8 +404,69 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
+/// Source footers loaded at once while choosing a rewrite's Variant layout.
+const MAX_CONCURRENT_FOOTER_LOADS: usize = 16;
+
+/// Chooses the one Variant layout every output of a rewrite shreds with.
+///
+/// Loads the footer of each distinct source data file, one small range read
+/// per file with no data pages, and combines the layouts those files already
+/// chose from their shredded-leaf counts. A table without a top-level Variant
+/// column, or the default policy, reads nothing and shreds nothing.
+///
+/// # Errors
+///
+/// Returns [`CompactionError::Iceberg`] when the schema cannot be converted to
+/// Arrow, a source cannot be opened, or its footer cannot be read or combined.
+async fn combined_variant_layout(
+    file_io: &FileIO,
+    schema: &Schema,
+    sources: &[FileScanTask],
+    policy: &VariantShreddingPolicy,
+) -> Result<VariantLayout> {
+    let has_variant = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .any(|field| matches!(*field.field_type, iceberg::spec::Type::Variant(_)));
+    if !has_variant || *policy == VariantShreddingPolicy::default() {
+        return Ok(VariantLayout::default());
+    }
+    let logical = iceberg::arrow::schema_to_arrow_schema(schema)?;
+    let mut seen = std::collections::HashSet::new();
+    let distinct: Vec<(String, u64)> = sources
+        .iter()
+        .filter(|task| seen.insert(task.data_file_path.as_str()))
+        .map(|task| (task.data_file_path.clone(), task.file_size_in_bytes))
+        .collect();
+    let footers: Vec<Arc<parquet::file::metadata::ParquetMetaData>> =
+        futures::stream::iter(distinct.into_iter().map(|(path, size)| {
+            let file_io = file_io.clone();
+            async move {
+                let input = file_io.new_input(&path)?;
+                let metadata = iceberg::io::FileMetadata { size };
+                let mut reader =
+                    iceberg::arrow::ArrowFileReader::new(metadata, input.reader().await?);
+                parquet::arrow::async_reader::AsyncFileReader::get_metadata(&mut reader, None)
+                    .await
+                    .map_err(|err| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::DataInvalid,
+                            format!("read the footer of {path}"),
+                        )
+                        .with_source(err)
+                    })
+            }
+        }))
+        .buffered(MAX_CONCURRENT_FOOTER_LOADS)
+        .try_collect()
+        .await?;
+    Ok(VariantLayout::combine(&logical, &footers, policy)?)
+}
+
 /// Builds the writer stack for one output partition of a rewrite.
 ///
+/// Every output shreds its Variant columns with `variant_layout`.
 /// `observer`, when present, is attached to the rolling writer so every output
 /// this stack opens and closes is reported. It is purely additive: the roll
 /// decision, the objects produced, and their order are identical with and
@@ -414,6 +486,7 @@ pub fn build_iceberg_data_file_writer(
     partition_spec: Arc<PartitionSpec>,
     sort_order_id: Option<i32>,
     execution_config: Arc<CompactionExecutionConfig>,
+    variant_layout: VariantLayout,
     observer: Option<Arc<dyn RollingWriterObserver>>,
 ) -> Result<Box<dyn IcebergWriter>> {
     let target_file_size =
@@ -430,7 +503,7 @@ pub fn build_iceberg_data_file_writer(
                 execution_config.write_parquet_properties.clone(),
                 schema.clone(),
             ),
-            execution_config.variant_shredding,
+            variant_layout,
         );
 
         let unique_uuid_suffix = Uuid::now_v7();
@@ -483,24 +556,38 @@ mod tests {
     use datafusion::arrow::compute::{cast, concat_batches};
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIO;
+    use iceberg::scan::FileScanTask;
     use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type, VariantType};
     use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-    use iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy;
+    use iceberg::writer::file_writer::variant_shredding::{
+        VariantLayout, VariantSampler, VariantShreddingPolicy,
+    };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::variant::{VariantArray, json_to_variant, unshred_variant, variant_to_json};
 
-    use super::build_iceberg_data_file_writer;
+    use super::{build_iceberg_data_file_writer, combined_variant_layout};
     use crate::config::CompactionExecutionConfigBuilder;
 
-    /// Each output rolled by the compaction writer stack infers its own Variant layout.
+    /// The policy values Wyrd passes.
+    const POLICY: VariantShreddingPolicy = VariantShreddingPolicy {
+        confidence_z: 2.5758,
+        margin: 0.02,
+        min_stratum_rows: 30,
+        min_frequency: 0.10,
+        max_tracked_children: 1_000,
+        max_emitted_children: 300,
+        max_depth: 50,
+    };
+
+    /// Every output of a rewrite shreds with the layout combined from its source footers.
     ///
-    /// A one-byte target rolls after every opened file and a two-row prefix
-    /// opens each file on its first batch, so the `{a}` and `{b}` batches land
-    /// in separate outputs. Each output must shred exactly its own field,
-    /// keep its logical `DataFile` row count, and read back every value
-    /// unchanged.
+    /// Two source files are written first, one shredding only `a` and one only
+    /// `b`. Their footers combine into a layout shredding both. A one-byte
+    /// target then rolls the `{a}` and `{b}` batches into separate outputs,
+    /// and each output must shred both fields, keep its logical row count, and
+    /// read back every value unchanged.
     #[tokio::test]
-    async fn rolled_outputs_infer_independent_variant_layouts() {
+    async fn rolled_outputs_share_the_combined_source_layout() {
         let temp_dir = tempfile::tempdir().expect("output directory");
         let file_io = FileIO::new_with_fs();
         let schema = Arc::new(
@@ -523,39 +610,59 @@ mod tests {
             ])
             .expect("batch")
         };
-        let config = CompactionExecutionConfigBuilder::default()
-            .target_file_size_bytes(1)
-            .variant_shredding(VariantShreddingPolicy {
-                max_rows: 2,
-                max_bytes: usize::MAX,
-                min_frequency_percent: 10,
-                max_tracked_children: 1_000,
-                max_emitted_children: 300,
-                max_depth: 50,
-            })
-            .build()
-            .expect("config");
-        let mut writer = build_iceberg_data_file_writer(
-            "test".to_owned(),
-            DefaultLocationGenerator::with_data_location(
-                temp_dir.path().to_str().expect("utf-8 path").to_owned(),
-            ),
-            schema,
-            file_io.clone(),
-            Arc::new(PartitionSpec::unpartition_spec()),
-            None,
-            Arc::new(config),
-            None,
-        )
-        .expect("writer stack");
-        writer
-            .write(batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]))
+        let first = batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]);
+        let second = batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]);
+        let writer_stack = |target: u64, layout: VariantLayout| {
+            let config = CompactionExecutionConfigBuilder::default()
+                .target_file_size_bytes(target)
+                .variant_shredding(POLICY)
+                .build()
+                .expect("config");
+            build_iceberg_data_file_writer(
+                "test".to_owned(),
+                DefaultLocationGenerator::with_data_location(
+                    temp_dir.path().to_str().expect("utf-8 path").to_owned(),
+                ),
+                schema.clone(),
+                file_io.clone(),
+                Arc::new(PartitionSpec::unpartition_spec()),
+                None,
+                Arc::new(config),
+                layout,
+                None,
+            )
+            .expect("writer stack")
+        };
+
+        let mut sources = Vec::new();
+        for source in [&first, &second] {
+            let mut sampler = VariantSampler::new(&arrow_schema, POLICY, 7, &[2]);
+            sampler.offer(source, &[0, 0], 0).expect("sample");
+            let mut writer = writer_stack(u64::MAX >> 1, sampler.layout());
+            writer.write(source.clone()).await.expect("source batch");
+            for data_file in writer.close().await.expect("source close") {
+                sources.push(
+                    FileScanTask::builder()
+                        .with_file_size_in_bytes(data_file.file_size_in_bytes())
+                        .with_start(0)
+                        .with_length(data_file.file_size_in_bytes())
+                        .with_data_file_path(data_file.file_path().to_owned())
+                        .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+                        .with_schema(schema.clone())
+                        .with_project_field_ids(vec![1, 2])
+                        .with_case_sensitive(true)
+                        .build(),
+                );
+            }
+        }
+        assert_eq!(sources.len(), 2, "one file per source");
+        let layout = combined_variant_layout(&file_io, &schema, &sources, &POLICY)
             .await
-            .expect("first batch");
-        writer
-            .write(batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]))
-            .await
-            .expect("second batch");
+            .expect("combined layout");
+
+        let mut writer = writer_stack(1, layout);
+        writer.write(first).await.expect("first batch");
+        writer.write(second).await.expect("second batch");
         let data_files = writer.close().await.expect("close");
         assert_eq!(data_files.len(), 2, "one output per batch");
 
@@ -595,8 +702,8 @@ mod tests {
                     .map(|json| json.expect("non-null").to_owned()),
             );
         }
-        shredded.sort();
-        assert_eq!(shredded, [vec!["a".to_owned()], vec!["b".to_owned()]]);
+        let both = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(shredded, [both.clone(), both]);
         values.sort();
         assert_eq!(values, [
             r#"{"a":1}"#,
