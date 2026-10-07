@@ -85,7 +85,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -93,7 +93,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.file_scan_tasks.clone(),
             self.file_type,
             self.schema.clone(),
-            projection.map(Vec::as_slice),
+            projection,
             filters,
             &self.file_io,
             self.need_seq_num,

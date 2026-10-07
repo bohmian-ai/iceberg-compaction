@@ -19,17 +19,17 @@ datafusion = "55.0.0"
 # Local workspace members
 futures = "0.3.17"
 # Managed Wyrd fork: minimal patch set over RisingWave dev_rebase_main_20260807 5d8df5e5f0508b31f2ada532dc861e97820f96af.
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6" }
-iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6" }
-iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6" }
-iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c" }
+iceberg-catalog-glue = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c" }
+iceberg-catalog-memory = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c" }
+iceberg-catalog-rest = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6" }
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e999331f280b698bcd026550812b5047e8789df6", features = [
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c" }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust.git", rev = "e12773876e9a1974f7e1d0fc57eef1bea6489e5c", features = [
     "opendal-s3",
 ] }
 
-parquet = { version = "59.2", features = ["async"] }
+parquet = { version = "60.0", features = ["async"] }
 port_scanner = "0.1.5"
 rand = "0.9.0"
 
@@ -73,3 +73,6 @@ str_to_string = "warn"
 large_enum_variant = "allow"
 # TODO: this makes sense, but it's too noisy for now (2025-03-10)
 result_large_err = "allow"
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
