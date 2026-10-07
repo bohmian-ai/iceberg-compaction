@@ -474,3 +474,135 @@ pub fn build_iceberg_data_file_writer(
 
     Ok(Box::new(iceberg_task_writer))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::compute::{cast, concat_batches};
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type, VariantType};
+    use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
+    use iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::variant::{VariantArray, json_to_variant, unshred_variant, variant_to_json};
+
+    use super::build_iceberg_data_file_writer;
+    use crate::config::CompactionExecutionConfigBuilder;
+
+    /// Each output rolled by the compaction writer stack infers its own Variant layout.
+    ///
+    /// A one-byte target rolls after every opened file and a two-row prefix
+    /// opens each file on its first batch, so the `{a}` and `{b}` batches land
+    /// in separate outputs. Each output must shred exactly its own field,
+    /// keep its logical `DataFile` row count, and read back every value
+    /// unchanged.
+    #[tokio::test]
+    async fn rolled_outputs_infer_independent_variant_layouts() {
+        let temp_dir = tempfile::tempdir().expect("output directory");
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).expect("arrow schema"));
+        let batch = |ids: [i64; 2], json: [&str; 2]| {
+            let json: ArrayRef = Arc::new(StringArray::from(json.to_vec()));
+            let variant: ArrayRef = json_to_variant(&json).expect("variant").into();
+            let variant = cast(&variant, arrow_schema.field(1).data_type()).expect("storage");
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                variant,
+            ])
+            .expect("batch")
+        };
+        let config = CompactionExecutionConfigBuilder::default()
+            .target_file_size_bytes(1)
+            .variant_shredding(VariantShreddingPolicy {
+                max_rows: 2,
+                max_bytes: usize::MAX,
+                min_frequency_percent: 10,
+                max_tracked_children: 1_000,
+                max_emitted_children: 300,
+                max_depth: 50,
+            })
+            .build()
+            .expect("config");
+        let mut writer = build_iceberg_data_file_writer(
+            "test".to_owned(),
+            DefaultLocationGenerator::with_data_location(
+                temp_dir.path().to_str().expect("utf-8 path").to_owned(),
+            ),
+            schema,
+            file_io.clone(),
+            Arc::new(PartitionSpec::unpartition_spec()),
+            None,
+            Arc::new(config),
+            None,
+        )
+        .expect("writer stack");
+        writer
+            .write(batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]))
+            .await
+            .expect("first batch");
+        writer
+            .write(batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]))
+            .await
+            .expect("second batch");
+        let data_files = writer.close().await.expect("close");
+        assert_eq!(data_files.len(), 2, "one output per batch");
+
+        let mut shredded = Vec::new();
+        let mut values = Vec::new();
+        for data_file in &data_files {
+            assert_eq!(data_file.record_count(), 2);
+            let bytes = file_io
+                .new_input(data_file.file_path())
+                .expect("input")
+                .read()
+                .await
+                .expect("bytes");
+            let read = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .expect("reader")
+                .build()
+                .expect("batches")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows");
+            let read = concat_batches(&read[0].schema(), &read).expect("one batch");
+            let variant = VariantArray::try_new(read.column_by_name("v").expect("v").as_ref())
+                .expect("variant storage");
+            shredded.push(
+                match variant.typed_value_column().map(|typed| typed.data_type()) {
+                    Some(datafusion::arrow::datatypes::DataType::Struct(fields)) => fields
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect::<Vec<_>>(),
+                    other => panic!("expected an object layout, got {other:?}"),
+                },
+            );
+            let logical: ArrayRef = unshred_variant(&variant).expect("unshred").into();
+            values.extend(
+                variant_to_json(&logical)
+                    .expect("json")
+                    .iter()
+                    .map(|json| json.expect("non-null").to_owned()),
+            );
+        }
+        shredded.sort();
+        assert_eq!(shredded, [vec!["a".to_owned()], vec!["b".to_owned()]]);
+        values.sort();
+        assert_eq!(values, [
+            r#"{"a":1}"#,
+            r#"{"a":300}"#,
+            r#"{"b":"x"}"#,
+            r#"{"b":"y"}"#
+        ]);
+    }
+}
