@@ -482,6 +482,13 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
 
+    /// Bounds and thresholds for choosing each output's shredded Variant layout.
+    ///
+    /// The default never shreds. Callers that shred pass their own internal
+    /// policy constants; each rolled output infers its own layout.
+    #[builder(default)]
+    pub variant_shredding: iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy,
+
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
 

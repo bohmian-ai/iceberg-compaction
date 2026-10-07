@@ -25,13 +25,13 @@ use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, PartitionSpec, Schema};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::{
     RollingFileWriterBuilder, RollingWriterObserver,
 };
+use iceberg::writer::file_writer::{ParquetWriterBuilder, VariantParquetWriterBuilder};
 use iceberg::writer::{IcebergWriter, TaskWriter};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -425,9 +425,12 @@ pub fn build_iceberg_data_file_writer(
         })?;
 
     let data_file_builder = {
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            execution_config.write_parquet_properties.clone(),
-            schema.clone(),
+        let parquet_writer_builder = VariantParquetWriterBuilder::new(
+            ParquetWriterBuilder::new(
+                execution_config.write_parquet_properties.clone(),
+                schema.clone(),
+            ),
+            execution_config.variant_shredding,
         );
 
         let unique_uuid_suffix = Uuid::now_v7();
