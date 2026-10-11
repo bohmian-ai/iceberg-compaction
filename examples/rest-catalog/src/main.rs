@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // iceberg_configs.insert("scope".to_owned(), "your-scope".to_owned());
 
     let catalog = Arc::new(
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+        iceberg_catalog_rest::RestCatalogBuilder::default()
             .load("rest", iceberg_configs)
             .await
             .expect("failed to build rest catalog"),

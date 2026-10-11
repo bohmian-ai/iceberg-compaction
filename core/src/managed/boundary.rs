@@ -8,10 +8,11 @@
 //! nothing about, so a core that could commit would be quietly deciding
 //! something it has no authority to decide.
 //!
-//! This module is the seam Wyrd holds instead. It offers exactly two
-//! capabilities — plan a snapshot, and rewrite one plan into candidate objects
-//! — and no third. There is no commit method, no transaction, no catalog
-//! mutation, and no handle that reaches one. Upstream's committing composition
+//! This module is the seam Wyrd holds instead. It offers exactly one
+//! capability — rewrite one plan into candidate objects. Wyrd plans through
+//! [`CompactionPlanner`](crate::compaction::CompactionPlanner) directly, against
+//! a table it loaded itself. There is no commit method, no transaction, no
+//! catalog mutation, and no handle that reaches one. Upstream's committing composition
 //! is untouched and remains available to other consumers; it is simply not
 //! reachable from here.
 
@@ -25,10 +26,8 @@ use crate::config::CompactionConfig;
 use crate::error::Result;
 use crate::executor::DataFusionExecutor;
 use crate::managed::context::ManagedExecutionContext;
-use crate::managed::observer::AttemptId;
-use crate::managed::selection::SelectionReport;
 
-/// Plans and rewrites one table without any authority to publish the result.
+/// Rewrites one table's plans without any authority to publish the result.
 ///
 /// Bound to exactly one attempt: the leased runtime, memory budget, scratch
 /// root, cancellation token, and observer all come from the
@@ -37,14 +36,12 @@ use crate::managed::selection::SelectionReport;
 /// attempt's identity.
 pub struct NonCommittingCompaction {
     inner: crate::compaction::Compaction,
-    context: Arc<ManagedExecutionContext>,
 }
 
 impl std::fmt::Debug for NonCommittingCompaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NonCommittingCompaction")
             .field("table_ident", &self.inner.table_ident)
-            .field("attempt_id", &self.context.attempt_id())
             .finish_non_exhaustive()
     }
 }
@@ -65,49 +62,9 @@ impl NonCommittingCompaction {
     ) -> Self {
         let inner = CompactionBuilder::new(catalog, table_ident)
             .with_config(config)
-            .with_executor(Box::new(DataFusionExecutor::with_context(Arc::clone(
-                &context,
-            ))))
+            .with_executor(Box::new(DataFusionExecutor::with_context(context)))
             .build();
-        Self { inner, context }
-    }
-
-    /// Returns the attempt this boundary belongs to.
-    #[must_use]
-    pub fn attempt_id(&self) -> AttemptId {
-        self.context.attempt_id()
-    }
-
-    /// Returns the leased resources this boundary executes against.
-    #[must_use]
-    pub fn context(&self) -> &Arc<ManagedExecutionContext> {
-        &self.context
-    }
-
-    /// Loads the table as the catalog currently sees it.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the catalog's load failure.
-    pub async fn load_table(&self) -> Result<Table> {
-        Ok(self
-            .inner
-            .catalog
-            .load_table(&self.inner.table_ident)
-            .await?)
-    }
-
-    /// Plans against the configured branch and returns the durable selection
-    /// report alongside the plans it authorises.
-    ///
-    /// # Errors
-    ///
-    /// Propagates
-    /// [`plan_compaction_with_report`](crate::compaction::Compaction::plan_compaction_with_report):
-    /// a missing configuration, an absent branch snapshot, a planning failure,
-    /// or a report that would not be canonical.
-    pub async fn plan_with_report(&self) -> Result<(Vec<CompactionPlan>, SelectionReport)> {
-        self.inner.plan_compaction_with_report().await
+        Self { inner }
     }
 
     /// Rewrites one plan into candidate objects, publishing nothing.
@@ -282,12 +239,10 @@ mod tests {
             );
         }
 
-        // The seam's own surface is exactly plan, rewrite, and the identities
-        // needed to attribute them. `compact` in particular is upstream's
-        // plan-execute-commit shortcut and must not be reachable.
+        // The seam's own surface is exactly rewrite. `compact` in particular is
+        // upstream's plan-execute-commit shortcut and must not be reachable.
         assert!(!body.contains("pub async fn compact"));
         assert!(!body.contains("pub fn catalog"));
-        assert!(body.contains("pub async fn plan_with_report"));
         assert!(body.contains("pub async fn rewrite("));
 
         // Runtime proof: the whole boundary runs against a catalog that turns
@@ -350,19 +305,9 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
-            Arc::clone(&context),
+            context,
         );
-        assert_eq!(boundary.attempt_id(), context.attempt_id());
-        assert!(Arc::ptr_eq(boundary.context(), &context));
-
-        // A table with no snapshot has nothing to plan, and the seam says so
-        // rather than inventing one.
-        let planned = boundary.load_table().await.unwrap();
-        assert!(planned.metadata().current_snapshot().is_none());
-        assert!(
-            boundary.plan_with_report().await.is_err(),
-            "a branch with no snapshot cannot authorise a plan"
-        );
+        assert!(format!("{boundary:?}").contains("NonCommittingCompaction"));
 
         // The refusal is real, not merely unexercised.
         let refused = ReadOnlyCatalog {
