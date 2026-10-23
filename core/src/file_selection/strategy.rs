@@ -1173,11 +1173,16 @@ impl std::fmt::Display for PlanStrategy {
     }
 }
 
+/// A file's partition spec id paired with its partition tuple.
+///
+/// Tuples are only comparable under one spec: after spec evolution, equal
+/// values under different specs name different partitions. A task without a
+/// spec keeps `None` rather than assuming a default.
 #[derive(Eq, Hash, PartialEq)]
-struct PartitionKey(iceberg::spec::Struct);
+struct PartitionKey(Option<i32>, iceberg::spec::Struct);
 
-/// Groups files by their partition key, which is based on the values of their
-/// partition fields.
+/// Groups files by their partition key, which is their partition spec id and
+/// the values of their partition fields.
 ///
 /// If the table is unpartitioned, all files will be grouped together. It's
 /// possible for data files not have have a partition, such as in the case of a
@@ -1187,12 +1192,13 @@ fn group_files_by_partition<I>(files: I) -> HashMap<PartitionKey, Vec<FileScanTa
 where I: Iterator<Item = FileScanTask> {
     let mut partitioned_groups: HashMap<PartitionKey, Vec<FileScanTask>> = HashMap::new();
     for file in files {
+        let spec_id = file.partition_spec.as_ref().map(|spec| spec.spec_id());
         let partition_key = match &file.partition {
-            Some(partition) => PartitionKey(partition.clone()),
+            Some(partition) => PartitionKey(spec_id, partition.clone()),
             // All FileScanTask files will have a partition value, even if it's empty. None doesn't
             // seem to be a valid value (although that could change). For now, set it to the default
             // value for an unpartitioned file, which is an empty Struct.
-            None => PartitionKey(iceberg::spec::Struct::empty()),
+            None => PartitionKey(spec_id, iceberg::spec::Struct::empty()),
         };
         partitioned_groups
             .entry(partition_key)
@@ -1231,6 +1237,7 @@ mod tests {
         has_deletes: bool,
         delete_types: Vec<iceberg::spec::DataContentType>,
         partition: Option<iceberg::spec::Struct>,
+        partition_spec: Option<Arc<iceberg::spec::PartitionSpec>>,
         schema: Option<Arc<iceberg::spec::Schema>>,
         data_sequence_number: Option<i64>,
     }
@@ -1243,6 +1250,7 @@ mod tests {
                 has_deletes: false,
                 delete_types: vec![],
                 partition: None,
+                partition_spec: None,
                 schema: None,
                 data_sequence_number: None,
             }
@@ -1266,6 +1274,16 @@ mod tests {
 
         pub fn with_partition(mut self, partition: iceberg::spec::Struct) -> Self {
             self.partition = Some(partition);
+            self
+        }
+
+        pub fn with_partition_spec(mut self, spec_id: i32) -> Self {
+            self.partition_spec = Some(Arc::new(
+                iceberg::spec::PartitionSpec::builder(get_test_schema_with_partition())
+                    .with_spec_id(spec_id)
+                    .build()
+                    .unwrap(),
+            ));
             self
         }
 
@@ -1327,7 +1345,7 @@ mod tests {
                 file_sequence_number: Some(1),
                 file_size_in_bytes: self.size,
                 partition: self.partition,
-                partition_spec: None,
+                partition_spec: self.partition_spec,
                 name_mapping: None,
                 unified_partition_type: None,
                 case_sensitive: true,
@@ -3420,6 +3438,66 @@ mod tests {
             5,
             "Should have 5 groups (one per partition), not 1 combined group"
         );
+    }
+
+    #[test]
+    fn test_partition_groups_are_scoped_by_spec() {
+        // Equal tuples, including null ones, under different specs are
+        // different partitions; files of one spec and tuple still group.
+        let build_file = |name: &str, spec_id: Option<i32>, value: Option<i32>| {
+            let builder = TestFileBuilder::new(name)
+                .size(1024 * 1024)
+                .with_partition(iceberg::spec::Struct::from_iter([value.map(|value| {
+                    iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(value))
+                })]))
+                .with_schema(get_test_schema_with_partition());
+            match spec_id {
+                Some(spec_id) => builder.with_partition_spec(spec_id),
+                None => builder,
+            }
+            .build()
+        };
+        let files = vec![
+            build_file("s1_v3_a.parquet", Some(1), Some(3)),
+            build_file("s1_v3_b.parquet", Some(1), Some(3)),
+            build_file("s2_v3.parquet", Some(2), Some(3)),
+            build_file("s1_null.parquet", Some(1), None),
+            build_file("s2_null.parquet", Some(2), None),
+            build_file("none_v3.parquet", None, Some(3)),
+        ];
+        let strategy = PlanStrategy::new_custom(None, None, GroupingStrategy::Single, None);
+        let groups = strategy
+            .execute(files, &CompactionPlanningConfig::default())
+            .unwrap();
+
+        let mut memberships = groups
+            .iter()
+            .map(|group| {
+                let mut paths = group
+                    .data_files
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.partition_spec.as_ref().map(|spec| spec.spec_id()),
+                            file.data_file_path.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths
+            })
+            .collect::<Vec<_>>();
+        memberships.sort();
+        assert_eq!(memberships, vec![
+            vec![(None, "none_v3.parquet".to_owned())],
+            vec![(Some(1), "s1_null.parquet".to_owned())],
+            vec![
+                (Some(1), "s1_v3_a.parquet".to_owned()),
+                (Some(1), "s1_v3_b.parquet".to_owned()),
+            ],
+            vec![(Some(2), "s2_null.parquet".to_owned())],
+            vec![(Some(2), "s2_v3.parquet".to_owned())],
+        ]);
     }
 
     #[test]
